@@ -682,6 +682,28 @@ removed = collect_generations(root) + collect_runtime_generations(install_state_
 print("[stage2] collected", len(removed), "unused dependency generations")
 ' || echo "[stage2] Warning: dependency refresh failed; continuing"
 
+# --- Seed vendored plugins (shrinedogg custom build) ---
+# This build vendors the harness2 plugin under plugins-vendor/ (git
+# shrinedogg/harness2-hermes @ the catalog pin) so a fresh HERMES_HOME comes
+# up with it installed, matching the plugin catalog entry this branch adds.
+# Copy each vendored tree into $HERMES_HOME/plugins/ ONLY when absent:
+# a manual install, a catalog update, or any user file in the plugin dir
+# always wins. Never clobbers an existing install.
+if [ -d "$INSTALL_DIR/plugins-vendor" ]; then
+    as_hermes mkdir -p "$HERMES_HOME/plugins"
+    for vendor in "$INSTALL_DIR"/plugins-vendor/*; do
+        [ -d "$vendor" ] || continue
+        vendor_name="$(basename "$vendor")"
+        if [ ! -d "$HERMES_HOME/plugins/$vendor_name" ]; then
+            as_hermes cp -a "$vendor" "$HERMES_HOME/plugins/$vendor_name" \
+                || echo "[stage2] Warning: seeding vendored plugin $vendor_name failed; continuing"
+            echo "[stage2] Seeded vendored plugin $vendor_name into $HERMES_HOME/plugins/"
+        else
+            echo "[stage2] Plugin $vendor_name already installed; leaving existing install untouched"
+        fi
+    done
+fi
+
 # auth.json: bootstrap from env on first boot only. Same semantics as the
 # pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
 # rotated refresh tokens on container restart.
