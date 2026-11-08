@@ -17,10 +17,10 @@
 # access to the shrinedogg Docker Hub account).
 name: Docker Build and Publish (Docker Hub, shrinedogg)
 
+# Trigger: manual dispatch only. Pushing to this branch (e.g. a workflow or
+# vendor fix) must NOT spawn a duplicate build mid-flight; the cutover
+# watchdog drives every build via workflow_dispatch.
 on:
-  push:
-    branches:
-      - 'build/dockerhub-*'
   workflow_dispatch:
     inputs:
       commit:
@@ -46,7 +46,12 @@ env:
 jobs:
   build:
     name: Build and publish (amd64)
-    runs-on: ubuntu-latest
+    # Self-hosted runner cluster0-hermes (label 'hermes'): DinD sidecar with
+    # zot.biggs.dog registry mirror + hermes-build egress (PR biggs.dog#796).
+    # Falls through to ubuntu-latest while no self-hosted runner is online
+    # (GitHub waits for a labeled runner by default; the list syntax keeps
+    # the job assignable to either).
+    runs-on: [hermes, ubuntu-latest]
     timeout-minutes: 90
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
