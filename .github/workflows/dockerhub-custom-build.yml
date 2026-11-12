@@ -51,7 +51,7 @@ jobs:
     # Falls through to ubuntu-latest while no self-hosted runner is online
     # (GitHub waits for a labeled runner by default; the list syntax keeps
     # the job assignable to either).
-    runs-on: [hermes, ubuntu-latest]
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
