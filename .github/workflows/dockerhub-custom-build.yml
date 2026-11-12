@@ -46,12 +46,11 @@ env:
 jobs:
   build:
     name: Build and publish (amd64)
-    # Self-hosted runner cluster0-hermes (label 'hermes'): DinD sidecar with
-    # zot.biggs.dog registry mirror + hermes-build egress (PR biggs.dog#796).
-    # Falls through to ubuntu-latest while no self-hosted runner is online
-    # (GitHub waits for a labeled runner by default; the list syntax keeps
-    # the job assignable to either).
-    runs-on: ubuntu-latest
+    # Self-hosted runner cluster0-hermes ONLY (label 'hermes'): DinD sidecar
+    # with zot.biggs.dog registry mirror + hermes-build egress (PR biggs.dog#796).
+    # No hosted fallback: while the runner is offline the job waits - the
+    # image must be built on cluster0's runner, never on GH-hosted runners.
+    runs-on: hermes
     timeout-minutes: 90
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
