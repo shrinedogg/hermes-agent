@@ -41,7 +41,7 @@ __all__ = [
     "store_owner_name",
 ]
 
-_KNOWN_PROVIDERS = ("sqlite",)
+_KNOWN_PROVIDERS = ("sqlite", "postgres")
 
 # The names a handle forwards to its bound store: the storage interface's attributes and the eager open.
 _FORWARDED = frozenset(inspect.get_annotations(PersistenceStore)) | {"ready"}
@@ -142,6 +142,22 @@ def _provider_for_home(home: Path) -> str:
     ``config.yaml`` for another one. An absent section or file means ``sqlite``."""
     from hermes_constants import get_hermes_home, hermes_home_key
 
+    section = _persistence_section(home)
+    provider = "sqlite"
+    if isinstance(section, dict) and section.get("provider"):
+        provider = str(section["provider"])
+    if provider not in _KNOWN_PROVIDERS:
+        raise ValueError(
+            f"unknown persistence provider {provider!r} for {home} (known: {', '.join(_KNOWN_PROVIDERS)})"
+        )
+    return provider
+
+
+def _persistence_section(home: Path) -> Any:
+    """The ``persistence`` section of ``home``'s config: the process config for the current home, the
+    target's own ``config.yaml`` for another one; ``None`` when the section or file is absent."""
+    from hermes_constants import get_hermes_home, hermes_home_key
+
     section: Any = None
     if hermes_home_key(home) == hermes_home_key(get_hermes_home()):
         from hermes_cli.config import load_config_readonly
@@ -159,14 +175,16 @@ def _provider_for_home(home: Path) -> str:
                 loaded = None
             if isinstance(loaded, dict):
                 section = loaded.get("persistence")
-    provider = "sqlite"
-    if isinstance(section, dict) and section.get("provider"):
-        provider = str(section["provider"])
-    if provider not in _KNOWN_PROVIDERS:
-        raise ValueError(
-            f"unknown persistence provider {provider!r} for {home} (known: {', '.join(_KNOWN_PROVIDERS)})"
-        )
-    return provider
+    return section
+
+
+def _schema_for_home(home: Path) -> Optional[str]:
+    """The optional ``persistence.schema`` of ``home`` (plan D5): a single-profile host names its store schema
+    directly; absent or blank means the per-profile naming rule."""
+    section = _persistence_section(home)
+    if isinstance(section, dict) and section.get("schema"):
+        return str(section["schema"])
+    return None
 
 
 def _assemble(provider: str, stores: Mapping[str, Path], *, read_only: bool = False,
@@ -176,6 +194,14 @@ def _assemble(provider: str, stores: Mapping[str, Path], *, read_only: bool = Fa
         from persistence.sqlite import SQLiteBackend
 
         return SQLiteBackend(stores, read_only=read_only, read_patience_s=read_patience_s, check_drift=check_drift)
+    if provider == "postgres":
+        # One served home's optional ``persistence.schema`` override names its store schema directly
+        # (plan D5); a single-profile host serves every scope through it.
+        from persistence.postgres import PostgresBackend
+
+        schema = _schema_for_home(Path(next(iter(stores)))) if len(stores) == 1 else None
+        return PostgresBackend(stores, schema=schema, read_only=read_only,
+                              read_patience_s=read_patience_s, check_drift=check_drift)
     raise ValueError(f"unknown persistence provider {provider!r}")
 
 
@@ -296,12 +322,19 @@ def open_profile_repair(scope: ProfileScope, *, read_only: bool) -> ProfileRepai
 
 
 def store_location(scope: ProfileScope) -> Optional[Path]:
-    """The file that holds ``scope``'s store under the configured provider, or ``None`` for a provider without one."""
+    """The file that holds ``scope``'s store under the configured provider, or ``None`` for a provider without one
+    (a postgres store lives in its schema in the shared database, not a file)."""
+    if _provider_for_home(scope.profile_dir) == "postgres":
+        return None
     return _state_db(scope)
 
 
 def storage_health(scope: ProfileScope) -> StorageHealth:
     """The health latch and readiness probe of ``scope``'s store, answered without opening it."""
+    if _provider_for_home(scope.profile_dir) == "postgres":
+        from persistence.postgres import PostgresStorageHealth, schema_for_home
+
+        return PostgresStorageHealth(schema_for_home(scope, _schema_for_home(scope.profile_dir)))
     from persistence.sqlite.services import SQLiteStorageHealth
 
     return SQLiteStorageHealth(_state_db(scope))
