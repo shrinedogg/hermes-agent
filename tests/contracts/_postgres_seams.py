@@ -175,9 +175,9 @@ def _cell(value: Any) -> Any:
     return value.timestamp() if isinstance(value, datetime) else value
 
 
-def _session_columns(store: PostgresStore) -> set[str]:
-    rows = store.all("SELECT column_name FROM information_schema.columns WHERE table_name = 'sessions'")
-    return {row["column_name"] for row in rows}
+def _session_columns(store: PostgresStore) -> dict[str, str]:
+    rows = store.all("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'sessions'")
+    return {row["column_name"]: row["data_type"] for row in rows}
 
 
 class _SessionCells:
@@ -192,11 +192,25 @@ class _SessionCells:
 
     def update(self, cells: Optional[Mapping[str, Any]] = None, **more: Any) -> None:
         cells = {**(cells or {}), **more}
-        unknown = set(cells) - _session_columns(self._store)
+        columns = _session_columns(self._store)
+        unknown = set(cells) - set(columns)
         if unknown:
             raise KeyError(f"sessions has no column {sorted(unknown)}")
         assignments = ", ".join(f"{column} = %s" for column in cells)
-        params = [_cell(value) for value in cells.values()]
+        params = []
+        for column, value in cells.items():
+            value = _cell(value)
+            # A corrupted cell: the SQLite reference's REAL affinity stores a text value verbatim and the
+            # stored read degrades it (untrusted -> the trust-window floor); a double precision column
+            # holds numbers only, so a non-numeric text is planted as the window ceiling, which reads
+            # back untrusted the same way (the ``stored_instant`` convention's damaged-page case).
+            if columns[column] == "double precision" and isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    from persistence.sqlite.conversation._store.rules import EPOCH_MAX
+                    value = EPOCH_MAX + 1.0
+            params.append(value)
         if not _pg_write(self._store, f"UPDATE sessions SET {assignments} WHERE id = %s", (*params, self._session_id)):
             raise KeyError(self._session_id)
 
