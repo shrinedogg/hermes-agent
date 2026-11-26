@@ -303,6 +303,37 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started ON sessions(created_source, started_at DESC) WHERE source = 'local'",
     # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
+    """CREATE OR REPLACE FUNCTION hermes_json_valid(text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF $1 IS NULL THEN
+    RETURN false;
+  END IF;
+  BEGIN
+    PERFORM ($1)::jsonb;
+    RETURN true;
+  EXCEPTION WHEN invalid_text_representation THEN
+    RETURN false;
+  END;
+END;
+$$""",
+    # ``convert_from`` on this server rejects a NUL byte inside the source bytea (``invalid byte
+    # sequence for encoding "UTF8": 0x00``), and PostgreSQL ships no bytea string-substitution
+    # (no ``replace``/``translate`` over bytea), so a NUL-safe bytea-to-text conversion is its own
+    # function: walk the hex pair by pair, map each ``00`` pair to ``20`` (space), re-decode.
+    """CREATE OR REPLACE FUNCTION hermes_nul_safe_text(content bytea) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN content IS NULL THEN NULL
+             ELSE convert_from(
+                    decode(
+                      translate(
+                        replace(regexp_replace(encode(content, 'hex'), '(..)', '~\\1~', 'g'),
+                                '~00~', '~20~'),
+                        '~', ''),
+                      'hex'),
+                    'UTF8')
+             END
+$$""",
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard
 BEFORE DELETE ON sessions
