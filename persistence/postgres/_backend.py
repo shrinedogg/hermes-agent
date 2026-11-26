@@ -283,6 +283,20 @@ def _dsn() -> str:
     return url
 
 
+@contextmanager
+def _schema_ddl_lock(schema: str) -> Iterator[None]:
+    """A session-level advisory lock serialising declarative-DDL application on one schema across
+    processes: concurrent first writes race the DDL, the application is idempotent, so the losers
+    simply wait and re-apply it."""
+    key = int(hashlib.sha1(schema.encode("utf-8")).hexdigest()[:8], 16)
+    with psycopg.connect(_dsn(), autocommit=True) as conn:
+        conn.execute("SELECT pg_advisory_lock(%s)", (key,))
+        try:
+            yield
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
+
 def _pool_for(dsn: str) -> ConnectionPool:
     with _POOL_LOCK:
         pool = _POOLS.get(dsn)
@@ -334,11 +348,13 @@ def _valid_schema_name(name: str) -> None:
         raise ValueError(f"invalid postgres schema name {name!r}")
 
 
-def schema_for_home(scope: ProfileScope, override: Optional[str] = None) -> str:
+def schema_for_home(scope: ProfileScope, override: Optional[str] = None, namespace: Optional[str] = None) -> str:
     """The store schema of ``scope`` in the shared database: ``hermes_<profile>_<12 hex of the profile
     path>`` (the old rule: a valid PG identifier, no ``pg_`` prefix, per-profile). ``override`` is the
     configured ``persistence.schema`` (plan 2.5): a single-profile host names its schema directly and
-    every scope served by that backend shares it."""
+    every scope served by that backend shares it. ``namespace`` (one assembly's suffix, e.g. the suite
+    seams' per-instance token) keeps every assembly's schemas apart: a fresh assembly starts from
+    empty stores, while handles of one assembly still share their profile's schema."""
     if override:
         _valid_schema_name(override)
         return override
@@ -346,7 +362,13 @@ def schema_for_home(scope: ProfileScope, override: Optional[str] = None) -> str:
     name = re.sub(r"[^a-z0-9_]", "_", (scope.name or "default").lower()) or "default"
     if name.startswith("pg_"):
         name = f"_{name}"
-    return f"hermes_{name}_{digest}"
+    result = f"hermes_{name}_{digest}"
+    if namespace:
+        suffix = re.sub(r"[^a-z0-9_]", "_", namespace.lower()).rstrip("_")
+        if suffix:
+            result = f"{result}_{suffix}"[:63]
+    _valid_schema_name(result)
+    return result
 
 
 # ── health (the corruption latch and the readiness probe) ─────────────────────
@@ -417,18 +439,23 @@ class PostgresBackend:
     def __init__(
         self, stores: Mapping[str, Path], *, schema: Optional[str] = None, read_only: bool = False,
         read_patience_s: Optional[float] = None, check_drift: bool = False,
+        schema_namespace: Optional[str] = None,
     ) -> None:
         """``stores`` maps each served ``hermes_home_key`` to its state location; on PostgreSQL the path is the
         SQLite location the assembly still computes and the store itself is the schema named by
         :func:`schema_for_home` in the ``HERMES_DATABASE_URL`` database. ``read_patience_s`` and ``check_drift``
-        are the SQLite constructor's ideas, accepted and ignored here (see the module docstring)."""
+        are the SQLite constructor's ideas, accepted and ignored here (see the module docstring).
+        ``schema_namespace`` (one assembly's suffix) keeps this assembly's schemas apart from every other
+        assembly's, so a fresh assembly sees empty stores."""
         self._stores = {key: Path(path) for key, path in stores.items()}
         self.schema_override = schema
         self.read_only = read_only
         self.read_patience_s = read_patience_s  # accepted, ignored (no file-lock patience on PostgreSQL)
         self.check_drift = check_drift  # accepted, ignored (declarative schema, no legacy drift)
+        self._schema_namespace = schema_namespace
         self.executor = _store_executor()
         self._lock = threading.Lock()
+        self._schema_create_lock = threading.Lock()  # serialises the schema-create path per process
         self._closed = False
         self._open_handles: list[PostgresStore] = []
         self._generations: dict[str, int] = {}
@@ -456,7 +483,7 @@ class PostgresBackend:
         self._require_open()
         with self._lock:
             key = scope.hermes_home_key
-            schema = self._schema_by_key.setdefault(key, schema_for_home(scope, self.schema_override))
+            schema = self._schema_by_key.setdefault(key, schema_for_home(scope, self.schema_override, self._schema_namespace))
         store = PostgresStore(self, scope, schema)
         with self._lock:
             self._open_handles.append(store)
@@ -489,18 +516,25 @@ class PostgresBackend:
 
     def close(self) -> None:
         """Release every connection this backend checked out and refuse further use; the schemas this
-        backend created are dropped (a fresh store's teardown), best effort."""
+        backend served are dropped (a fresh store's teardown, whether it created the schema or found
+        one an earlier store left), best effort."""
         with self._lock:
             self._closed = True
-            created = list(self._created_schemas)
+            to_drop = list(self._created_schemas)
+            for schema in self._schema_by_key.values():
+                if schema not in to_drop:
+                    to_drop.append(schema)
         self._release_connections()
-        for schema in created:
+        for schema in to_drop:
             try:
                 with translated():
                     with psycopg.connect(_dsn(), autocommit=True, connect_timeout=5) as conn:
+                        # A still-open sibling backend holding the schema's tables blocks the drop;
+                        # time out instead of deadlocking - the last backend to close drops it.
+                        conn.execute("SET SESSION lock_timeout = '5s'")
                         conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
             except PersistenceError:
-                pass  # a dropped database or unreachable server leaves the schema for the operator
+                pass  # a dropped database, unreachable server, or still-open sibling leaves the schema
 
     def close_store_under(self, scope: ProfileScope) -> None:
         """Force-close ``scope``'s store under its open handles, as a profile delete's sweep does: every
@@ -508,7 +542,7 @@ class PostgresBackend:
         key = scope.hermes_home_key
         schema = None
         with self._lock:
-            schema = self._schema_by_key.get(key) or schema_for_home(scope, self.schema_override)
+            schema = self._schema_by_key.get(key) or schema_for_home(scope, self.schema_override, self._schema_namespace)
             self._closed_schemas.add(schema)
         for store in list(self._open_handles):
             if store.schema == schema:
@@ -519,7 +553,7 @@ class PostgresBackend:
         open handles stay on the generation they hold (their writes now raise ``StoreReplaced``)."""
         key = scope.hermes_home_key
         with self._lock:
-            old = self._schema_by_key.get(key) or schema_for_home(scope, self.schema_override)
+            old = self._schema_by_key.get(key) or schema_for_home(scope, self.schema_override, self._schema_namespace)
             self._repl_counter += 1
             new = f"{old}_r{self._repl_counter}"[:63]
         _valid_schema_name(new)
@@ -595,6 +629,13 @@ class PostgresStore:
         self._schema_ready = False
         self._generation: Optional[int] = None
         self._snapshot_pins = threading.local()  # the read-snapshot connection each thread's open block pinned
+        # One write connection per handle, and a psycopg connection is not thread-safe: every write is
+        # serialised through this lock (the SQLite store's write-lock role - a contender that runs second
+        # starts after the first contender's commit, and its re-checks see the committed state).
+        self._write_lock = threading.RLock()
+        # The lazy first checkout of ``self._conn`` (shared by the read and write doors) is
+        # check-then-set: a plain lock keeps two threads from pinning two pool connections.
+        self._conn_assign_lock = threading.Lock()
         self.aio = AwaitableStore(self)
         for attribute in CAPABILITY_ATTRIBUTES:
             factory = _REPOSITORY_FACTORIES.get(attribute)
@@ -644,16 +685,19 @@ class PostgresStore:
             return pinned
         if self._conn is not None:
             return self._conn
-        self._backend._require_open()
-        dsn = _dsn()
-        with translated():
-            conn = _pool_for(dsn).getconn()
-            self._checkout(conn)
-            if not self._schema_exists(conn):
-                conn.close()  # discard: the pool creates a replacement on its next checkout
-                return None
-        self._conn = conn
-        return conn
+        with self._conn_assign_lock:
+            if self._conn is not None:
+                return self._conn
+            self._backend._require_open()
+            dsn = _dsn()
+            with translated():
+                conn = _pool_for(dsn).getconn()
+                self._checkout(conn)
+                if not self._schema_exists(conn):
+                    conn.close()  # discard: the pool creates a replacement on its next checkout
+                    return None
+            self._conn = conn
+            return conn
 
     def connection(self) -> Connection:
         """The handle's write connection, checked out on first use and pinned to this store's schema;
@@ -661,16 +705,19 @@ class PostgresStore:
         self._refuse_write()
         if self._conn is not None:
             return self._conn
-        self._backend._require_open()
-        dsn = _dsn()
-        with translated():
-            conn = _pool_for(dsn).getconn()
-            self._checkout(conn)
-            if self.read_only and not self._schema_exists(conn):
-                conn.close()  # discard: the pool creates a replacement on its next checkout
-                raise StoreUnavailable(f"postgres store for schema {self.schema!r} is not initialized")
-        self._conn = conn
-        return conn
+        with self._conn_assign_lock:
+            if self._conn is not None:
+                return self._conn
+            self._backend._require_open()
+            dsn = _dsn()
+            with translated():
+                conn = _pool_for(dsn).getconn()
+                self._checkout(conn)
+                if self.read_only and not self._schema_exists(conn):
+                    conn.close()  # discard: the pool creates a replacement on its next checkout
+                    raise StoreUnavailable(f"postgres store for schema {self.schema!r} is not initialized")
+            self._conn = conn
+            return conn
 
     def ensure_schema(self) -> None:
         """Create the store's schema and declarative DDL if the store has never been written (writer only):
@@ -679,18 +726,22 @@ class PostgresStore:
             return
         if self._schema_ready:
             return
-        if not self._schema_exists(self.connection()):
-            with translated():
-                with psycopg.connect(_dsn(), autocommit=True) as ddl:
-                    try:
-                        ddl.execute(f'CREATE SCHEMA "{self.schema}"')
-                    except psycopg.errors.DuplicateSchema:
-                        pass  # a concurrent creator won the race; the DDL below is idempotent
-                    ddl.execute(f'SET search_path TO "{self.schema}"')
-                    _ddl.apply(ddl)
+        with self._backend._schema_create_lock:
+            if self._schema_ready:
+                return
+            if not self._schema_exists(self.connection()):
+                with translated():
+                    with psycopg.connect(_dsn(), autocommit=True) as ddl:
+                        try:
+                            ddl.execute(f'CREATE SCHEMA "{self.schema}"')
+                        except psycopg.errors.DuplicateSchema:
+                            pass  # a concurrent creator won the race; the DDL below is idempotent
+                        ddl.execute(f'SET search_path TO "{self.schema}"')
+                        with _schema_ddl_lock(self.schema):
+                            _ddl.apply(ddl)
                 with self._backend._lock:
                     self._backend._created_schemas.add(self.schema)
-        self._schema_ready = True
+            self._schema_ready = True
         self._generation = self._backend._generation_for(self.schema)
 
     # ── verbs' doors ──
@@ -712,18 +763,19 @@ class PostgresStore:
         with translated():
             self.ensure_schema()
             conn = self.connection()
-            try:
-                yield conn
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                # A rollback undoes the checkout's ``SET search_path`` (plain SET is transaction-scoped: on
-                # rollback the session falls back to its previous default, which on a pooled connection is the
-                # previous store's pin or ``public``). Re-pin and settle it as the session default so the
-                # cached connection stays bound to this store's schema.
-                self._checkout(conn)
-                conn.commit()
-                raise
+            with self._write_lock:
+                try:
+                    yield conn
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    # A rollback undoes the checkout's ``SET search_path`` (plain SET is transaction-scoped: on
+                    # rollback the session falls back to its previous default, which on a pooled connection is the
+                    # previous store's pin or ``public``). Re-pin and settle it as the session default so the
+                    # cached connection stays bound to this store's schema.
+                    self._checkout(conn)
+                    conn.commit()
+                    raise
 
     # ── SQL ──
 
@@ -825,12 +877,18 @@ class PostgresStore:
 
     @property
     def owner_profile_name(self) -> Optional[str]:
-        """The profile owning this store: the scope's name (``default`` for the default root, the profile's
-        name for a named profile home), None for a folder outside the profile tree - the SQLite store's
-        own-profile derivation, never a guess."""
+        """The profile owning this store: the name of the home this store's registered location lives in
+        (``default`` for the default root, the profile's name for a named profile home), None for a location
+        outside the profile tree. The reference store derives its owner from its own ``state.db``; here the
+        registered location plays that role - the store's scope may name a different home than the root the
+        store is served under (the test backend switches the root under an open scope), so deriving from the
+        scope would guess. Never a guess: an underivable owner is None."""
+        location = self._backend._stores.get(self.scope.hermes_home_key)
+        if location is None:
+            return None
         from persistence_assembly import store_owner_name
 
-        return store_owner_name(Path(self.scope.profile_dir))
+        return store_owner_name(location.parent)
 
 
 register_health()

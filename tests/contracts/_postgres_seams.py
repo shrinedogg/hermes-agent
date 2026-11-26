@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Mapping, Optional, Sequence
 
@@ -250,7 +251,10 @@ class ContractPostgresBackend(PostgresBackend):
     handle carries the seeding seams."""
 
     def __init__(self, stores: Mapping[str, Any], *, root: Optional[Any] = None) -> None:
-        super().__init__(stores)
+        # A fresh assembly gets its own schema namespace: the suites' factory contract is that every
+        # call starts from empty stores (the reference assembly's per-assembly state), while handles
+        # of one assembly still share their profile's schema.
+        super().__init__(stores, schema_namespace=uuid.uuid4().hex[:8])
         self.root = root
         self._opened_scopes: list[ProfileScope] = []
 
