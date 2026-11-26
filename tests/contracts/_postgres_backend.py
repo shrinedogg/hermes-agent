@@ -54,6 +54,19 @@ def _open_postgres_backend(scopes: Sequence[ProfileScope]) -> Iterator[ContractP
         yield backend
     finally:
         backend.close()
+        # close() only drops the schemas this backend *created*; a schema left behind by a crashed run
+        # pre-existed, so it is neither tracked nor dropped and would bleed into every later factory call.
+        # Drop every schema this backend served to keep the per-call empty-store guarantee.
+        import psycopg
+
+        from persistence.postgres._backend import _dsn
+
+        for schema in list(getattr(backend, "_schema_by_key", {}).values()):
+            try:
+                with psycopg.connect(_dsn(), autocommit=True, connect_timeout=5) as conn:
+                    conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            except Exception:
+                pass  # an unreachable server or dropped database leaves the schema for the operator
         if previous is None:
             os.environ.pop("HERMES_HOME", None)
         else:

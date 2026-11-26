@@ -197,7 +197,9 @@ def _pool_for(dsn: str) -> ConnectionPool:
     with _POOL_LOCK:
         pool = _POOLS.get(dsn)
         if pool is None:
-            pool = ConnectionPool(conninfo=dsn, min_size=1, max_size=16, timeout=30)
+            # The contract suite opens many store handles per test without closing them (each pins one
+            # pool connection), so the scratch pool needs headroom well past any single test's pins.
+            pool = ConnectionPool(conninfo=dsn, min_size=1, max_size=64, timeout=30)
             try:
                 pool.open(wait=True)
             except Exception as exc:
