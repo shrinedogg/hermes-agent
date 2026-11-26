@@ -709,7 +709,12 @@ class PostgresStore:
                 conn = _pool_for(dsn).getconn()
                 self._checkout(conn)
                 if not self._schema_exists(conn):
-                    conn.close()  # discard: the pool creates a replacement on its next checkout
+                    # Hand the connection back to the pool instead of closing it: a closed connection is
+                    # invisible to the pool, so its slot stays counted against max_size forever and the
+                    # pool can never grow a replacement -- enough uninitialised reads would orphan every
+                    # slot and turn every later checkout into a 30-second timeout.
+                    conn.commit()  # park the checkout's implicit transaction (the SET pin) before parking
+                    _pool_for(dsn).putconn(conn)
                     return None
             self._conn = conn
             return conn
@@ -729,7 +734,10 @@ class PostgresStore:
                 conn = _pool_for(dsn).getconn()
                 self._checkout(conn)
                 if self.read_only and not self._schema_exists(conn):
-                    conn.close()  # discard: the pool creates a replacement on its next checkout
+                    # Hand the connection back to the pool instead of closing it (a closed connection is
+                    # invisible to the pool, so its slot stays counted against max_size forever).
+                    conn.commit()  # park the checkout's implicit transaction (the SET pin) before parking
+                    _pool_for(dsn).putconn(conn)
                     raise StoreUnavailable(f"postgres store for schema {self.schema!r} is not initialized")
             self._conn = conn
             return conn
