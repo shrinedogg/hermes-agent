@@ -3090,9 +3090,10 @@ def _optional_list(values) -> Optional[list]:
     return list(values) if values is not None else None
 
 
-def _sql_limit(window) -> int:
-    """The window's ``LIMIT`` operand; ``-1`` as no limit."""
-    return -1 if window.limit is None else window.limit
+def _sql_limit(window) -> Optional[int]:
+    """The window's ``LIMIT`` operand; ``None`` (bound as ``LIMIT NULL``) when unbounded - PostgreSQL
+    refuses a negative operand, unlike SQLite, whose ``LIMIT -1`` is a silent no-limit."""
+    return None if window.limit is None else window.limit
 
 
 def _last_active_value(row: Mapping) -> Optional[float]:

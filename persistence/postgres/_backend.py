@@ -629,6 +629,11 @@ class PostgresStore:
         self._schema_ready = False
         self._generation: Optional[int] = None
         self._snapshot_pins = threading.local()  # the read-snapshot connection each thread's open block pinned
+        # Every connection a snapshot block pinned, on any thread: a thread-local pin held by a
+        # different thread is invisible to a close() from here, and would otherwise leak the pool
+        # connection (the concurrency tests open and pin on worker threads, then close on the main one).
+        self._pinned_snapshot_conns: set = set()
+        self._pin_lock = threading.Lock()
         # One write connection per handle, and a psycopg connection is not thread-safe: every write is
         # serialised through this lock (the SQLite store's write-lock role - a contender that runs second
         # starts after the first contender's commit, and its re-checks see the committed state).
@@ -805,10 +810,14 @@ class PostgresStore:
             conn.commit()  # park the checkout's implicit transaction (the ``SET`` pin) before the snapshot
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
             self._snapshot_pins.conn = conn
+            with self._pin_lock:
+                self._pinned_snapshot_conns.add(conn)
             try:
                 yield ReadCheck(lambda: conn.info.transaction_status == self._SNAPSHOT_TX_INTRANS, pinned=True)
             finally:
                 self._snapshot_pins.conn = None
+                with self._pin_lock:
+                    self._pinned_snapshot_conns.discard(conn)
                 try:
                     if conn.info.transaction_status in (self._SNAPSHOT_TX_INTRANS, 3):  # in error too: end it
                         conn.rollback()  # release the snapshot; the block was reads-only, nothing commits
@@ -841,7 +850,7 @@ class PostgresStore:
         return next(iter(row.values()))
 
     def close(self) -> None:
-        """Hand the handle's connection back to the pool (``putconn`` closes it only when the pool is full)."""
+        """Hand the handle's connections back to the pool (``putconn`` closes it only when the pool is full)."""
         conn, self._conn = self._conn, None
         if conn is not None:
             try:
@@ -851,17 +860,29 @@ class PostgresStore:
                 pass
         pinned = getattr(self._snapshot_pins, "conn", None)
         if pinned is not None:
-            try:
-                if pinned.info.transaction_status in (self._SNAPSHOT_TX_INTRANS, 3):
-                    pinned.rollback()
-            except psycopg.Error:
-                pass
-            try:
-                with translated():
-                    _pool_for(_dsn()).putconn(pinned)
-            except PersistenceError:
-                pass
             self._snapshot_pins.conn = None
+            with self._pin_lock:
+                self._pinned_snapshot_conns.discard(pinned)
+            self._release_snapshot_pin(pinned)
+        # Pins held by OTHER threads' open blocks are invisible to this thread's local; drain them
+        # so a cross-thread close (the teardown closes on the main thread) returns every pool connection.
+        with self._pin_lock:
+            drained = list(self._pinned_snapshot_conns)
+            self._pinned_snapshot_conns.clear()
+        for pin in drained:
+            self._release_snapshot_pin(pin)
+
+    def _release_snapshot_pin(self, conn) -> None:
+        try:
+            if conn.info.transaction_status in (self._SNAPSHOT_TX_INTRANS, 3):  # in error too: end it
+                conn.rollback()  # release the snapshot; the block was reads-only, nothing commits
+        except psycopg.Error:
+            pass
+        try:
+            with translated():
+                _pool_for(_dsn()).putconn(conn)
+        except PersistenceError:
+            pass  # a dead connection is discarded below with the pool's replacement
 
     def serves_same_store(self, other: object) -> bool:
         """Whether ``other`` reads and writes through this handle's store: the same schema, and the same

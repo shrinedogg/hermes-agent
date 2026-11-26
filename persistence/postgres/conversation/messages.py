@@ -894,6 +894,19 @@ class PgMessageRepository:
 
     # ── the writers' shared doors ──
 
+    # ── cross-repo helper surface: the lineage/maintenance ports (the etc branch) call these on the
+    # repository as the stage-0 base surface exposed them; the implementations live in ``._store.common``.
+    def _message_row_params(self, session_id: str, role: str, msg: dict[str, Any], tool_calls: Any,
+                           message_timestamp: float) -> tuple:
+        from ._store import common as _common
+
+        return _common._message_row_params(session_id, role, msg, tool_calls, message_timestamp)
+
+    def _stamp_tool_call_uids(self, msg: dict[str, Any], tool_calls: Any, batch_index: dict[str, str]) -> None:
+        from ._store import common as _common
+
+        _common._stamp_tool_call_uids(msg, tool_calls, batch_index)
+
     def _append_one(self, store: PostgresStore, session_id: SessionId, msg: dict[str, Any], *,
                     turn_lease_holder: Optional[str], turn_lease_ttl_seconds: float) -> None:
         """One transcript write: the guards (with their last session-row step), the insert and the
