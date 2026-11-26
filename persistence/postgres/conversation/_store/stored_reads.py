@@ -27,8 +27,8 @@ __all__ = [
 # stored flag); the bytea body is scanned as UTF-8 text.
 _HANDOFF_PREDICATE = (
     "g.role IN ('user', 'assistant') AND (g._compressed_summary = 1"
-    " OR hermes_nul_safe_text(content) LIKE '[CONTEXT COMPACTION%%'"
-    " OR hermes_nul_safe_text(content) LIKE '[CONTEXT SUMMARY]%%')")
+    " OR hermes_nul_safe_text(g.content) LIKE '[CONTEXT COMPACTION%%'"
+    " OR hermes_nul_safe_text(g.content) LIKE '[CONTEXT SUMMARY]%%')")
 
 # The shown rows: their id/uid plus whether they can hold a handoff themselves (every other shown row is
 # read for its id, uid and flag only, so an ordinary page never loads its bodies a second time).
@@ -163,7 +163,10 @@ def transcript_handoffs_shown_before(store, segment: str, before: int,
         match.append("g.message_uid = ANY(%s)")
         params.append(uids)
     if contents:
-        match.append("(g.message_uid IS NULL OR g.message_uid = '') AND hermes_nul_safe_text(g.content) = ANY(%s)")
+        # The stored content column is BYTEA (a text payload's raw UTF-8 bytes; a structured payload
+        # its sentinel-prefixed JSON, the same storage form the handoff content encodes to), so the
+        # body compares bytea to bytea, not a decoded TEXT against bytea.
+        match.append("(g.message_uid IS NULL OR g.message_uid = '') AND g.content = ANY(%s)")
         params.append(contents)
     if not match:
         return []

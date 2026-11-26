@@ -792,10 +792,13 @@ class PgMessageRepository:
     def blocked_tool_result_payloads(self, *, since_ts: float) -> Iterator[tuple[str, Optional[str]]]:
         store = self._store
         with _refusals(store):
+            # Text content only (a structured payload sits behind the 0x00 sentinel, where the SQLite
+            # LIKE stops; the sentinel twin has length 0) and case-insensitive, as the store's scan.
             for row in store.all(
-                    "SELECT tool_call_id, content FROM messages WHERE role = 'tool' AND tool_call_id IS NOT NULL "
-                    "AND timestamp >= %s AND (hermes_nul_safe_text(content) LIKE '%%BLOCKED%%' "
-                    "OR hermes_nul_safe_text(content) LIKE '%%approval%%')", since_ts):
+                    f"SELECT tool_call_id, content FROM messages WHERE role = 'tool' AND tool_call_id IS NOT NULL "
+                    f"AND timestamp >= %s AND {CONTENT_TEXT_LEN} > 0 "
+                    f"AND (hermes_nul_safe_text(content) ILIKE '%%BLOCKED%%' "
+                    f"OR hermes_nul_safe_text(content) ILIKE '%%approval%%')", since_ts):
                 yield (row["tool_call_id"], _payload_str(row["content"]))
 
     def has_any_message(self) -> bool:
