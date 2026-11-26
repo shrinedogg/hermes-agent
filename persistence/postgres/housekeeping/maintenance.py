@@ -22,7 +22,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from persistence.authority.vocabulary import RETRY_HORIZON_S
 from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE
-from persistence.core.errors import AuthorityRefusal, Conflict, ExportTooLarge
+from persistence.core.errors import AuthorityRefusal, Conflict, ExportTooLarge, PermanentStoreError
 from persistence.core.identity import SessionId
 from persistence.housekeeping.maintenance import (
     IMPORT_MAX_MESSAGES_PER_SESSION, IMPORT_MAX_SESSIONS, IMPORT_MAX_SESSION_BYTES,
@@ -38,7 +38,7 @@ from psycopg import errors as pg_errors
 from .._backend import PostgresStore, register_repository, translated
 from .._lineage_common import json_marker_sql, session_last_active_sql
 from ..conversation.lineage import _INSERT_MESSAGE_SQL
-from ..conversation.messages import _row_to_message_dict, _transcript_row
+from ..conversation.messages import _payload_str, _row_to_message_dict, _transcript_row
 from .._stubs import add_stubs
 from persistence.sqlite.conversation._store.local import (
     API_BINDING_PREFIX, API_DECLARED_PREFIX, POLICY_PREFIX, _policy_target)
@@ -78,6 +78,13 @@ def _escape_like(text: str) -> str:
 
 def _like(value: str) -> str:
     return f"%{_escape_like(value.lower())}%"
+
+
+def _export_message_dict(row: Mapping[str, Any], *, summary_flag: bool = False) -> dict[str, Any]:
+    """``_row_to_message_dict`` over the export's raw ``SELECT *`` rows: the BYTEA payload columns decode
+    to the reference's text shape before the row dict is built (``content`` stays a str; the other
+    binary columns still drop)."""
+    return _row_to_message_dict({**row, "content": _payload_str(row.get("content"))}, summary_flag=summary_flag)
 
 
 def _cwd_prefix_filter(value: str):
@@ -519,9 +526,9 @@ def _write_guards_reject(conn, sid: str) -> bool:
     ``_write_guards_reject`` read-only shape: the guards' own reclamation lives in the
     transcript writers, which this store's prune path never calls)."""
     row = conn.execute(
-        "SELECT 1 FROM session_turn_leases WHERE conversation_id = %s AND expires_at > now() "
+        "SELECT 1 FROM session_turn_leases WHERE conversation_id = %s AND expires_at > EXTRACT(EPOCH FROM now()) "
         "UNION ALL SELECT 1 FROM compression_locks WHERE session_id = %s "
-        "AND expires_at > now() LIMIT 1", (sid, sid)).fetchone()
+        "AND expires_at > EXTRACT(EPOCH FROM now()) LIMIT 1", (sid, sid)).fetchone()
     return row is not None
 
 
@@ -918,11 +925,17 @@ class PgSessionMaintenance:
                   )
             """, (cutoff,)).fetchall()]
             ids = _retire_prunable(conn, ids, media_root=media_root)
+            # A concurrent prune that committed first deletes the same rows; RETURNING keeps the
+            # contenders' result sets disjoint (only the ids this DELETE removed).
+            removed: list[str] = []
             for chunk in _id_chunks(ids):
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(len(chunk))})", chunk)
+                deleted = conn.execute(
+                    f"DELETE FROM sessions WHERE id IN ({_placeholders(len(chunk))}) RETURNING id",
+                    chunk).fetchall()
+                removed.extend(row["id"] for row in deleted)
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
-            return ids
+            return removed
 
         with translated():
             with self._store.tx() as conn:
@@ -962,12 +975,14 @@ class PgSessionMaintenance:
                        if sid not in excluded and not _write_guards_reject(conn, sid)]
             if not victims:
                 return []
-            # Re-apply every predicate under the write lock.
-            conn.execute(
+            # Re-apply every predicate under the write lock; a concurrent sweep that committed first
+            # leaves those rows ended, so return exactly the ids this UPDATE ended - the contenders'
+            # result sets stay disjoint.
+            changed = conn.execute(
                 f"UPDATE sessions SET ended_at = %s, end_reason = 'startup_orphan_reap'"
-                f" WHERE id IN ({_placeholders(len(victims))}) AND ended_at IS NULL{scope_sql}",
-                (time.time(), *victims, *scope_params))
-            return victims
+                f" WHERE id IN ({_placeholders(len(victims))}) AND ended_at IS NULL{scope_sql} RETURNING id",
+                (time.time(), *victims, *scope_params)).fetchall()
+            return [row["id"] for row in changed]
 
         with translated():
             with self._store.tx() as conn:
@@ -1219,8 +1234,9 @@ class PgSessionMaintenance:
             f"SELECT {session_last_active_sql('s')} AS v FROM sessions s WHERE s.id = %s", session_id)
         return session
 
-    def _session_messages(self, store, session_id: str, include_compacted: bool = False,
-                         include_inactive: bool = False) -> list[dict[str, Any]]:
+    @staticmethod
+    def _session_messages(store, session_id: str, include_compacted: bool = False,
+                          include_inactive: bool = False) -> list[dict[str, Any]]:
         """One session's rows in storage order, the audit/display/live selection of the SQLite
         ``get_messages`` export flags (the display-generation dedupe of the native reader is a
         display-read concern; exports carry the raw rows)."""
@@ -1231,7 +1247,7 @@ class PgSessionMaintenance:
         else:
             clause = " AND active = 1"
         rows = store.all(f"SELECT * FROM messages WHERE session_id = %s{clause} ORDER BY id", session_id)
-        return [_row_to_message_dict(row, summary_flag=True) for row in rows]
+        return [_export_message_dict(row, summary_flag=True) for row in rows]
 
     @staticmethod
     def _with_messages(store, session: dict[str, Any], include_compacted: bool = False,
@@ -1325,11 +1341,14 @@ class PgSessionMaintenance:
     @classmethod
     def _export_all(cls, store, source: Optional[str] = None, include_compacted: bool = False,
                     include_inactive: bool = False) -> tuple[SessionExport, ...]:
+        # Order by the store recency read (the SQLite ``export_all`` ordering): the newest activity of
+        # last_activity_at, in-window message timestamps and started_at - not a two-column coalesce.
+        recency = session_last_active_sql("s")
         sessions = store.all(
-            f"SELECT * FROM sessions WHERE source = %s "
-            f"ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 100000", source) \
+            f"SELECT * FROM sessions s WHERE s.source = %s "
+            f"ORDER BY {recency} DESC, s.started_at DESC, s.id DESC LIMIT 100000", source) \
             if source else store.all(
-            "SELECT * FROM sessions ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 100000")
+            f"SELECT * FROM sessions s ORDER BY {recency} DESC, s.started_at DESC, s.id DESC LIMIT 100000")
         session_dicts = []
         for row in sessions:
             session = dict(row)
@@ -1352,7 +1371,7 @@ class PgSessionMaintenance:
                 f"ORDER BY session_id, id", *chunk)
             for row in rows:
                 messages_by_session[row["session_id"]].append(
-                    _row_to_message_dict(row, summary_flag=True))
+                    _export_message_dict(row, summary_flag=True))
         return tuple(SessionExport(session=_export_row(session, session.get("last_active")),
                                    messages=tuple(map(_transcript_row, messages_by_session[session["id"]])))
                      for session in session_dicts)
@@ -1515,6 +1534,12 @@ class PgSessionMaintenance:
             raise ValueError(errors[0]["error"])
 
         def _do(conn):
+            # Two concurrent imports of one origin race the check-then-mint; the transaction-level
+            # advisory lock (keyed on the origin identity) serialises them, so the loser re-reads after
+            # the winner commits and reports ``already_imported``.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (
+                f"foreign-import:{origin_dict['tool']}:"
+                f"{origin_dict.get('foreign_session_id') or origin_dict.get('path') or ''}",))
             existing = self._find_foreign_import_on_txn(conn, origin_dict)
             if existing:
                 return ForeignImportResult(session_id=SessionId(existing), already_imported=True)
@@ -1535,6 +1560,12 @@ class PgSessionMaintenance:
             except pg_errors.UniqueViolation as exc:
                 # The minted id is the primary key: a taken one fails the insert and the write rolls back.
                 raise Conflict("session", session_id) from exc
+            except PermanentStoreError as exc:
+                # The transaction's translation turns the raw unique violation into a permanent store error
+                # before this handler runs, so rewrap just that case as the contract's conflict.
+                if isinstance(exc.__cause__, pg_errors.UniqueViolation):
+                    raise Conflict("session", session_id) from exc
+                raise
 
     def _find_foreign_import_on_txn(self, conn, origin: dict) -> Optional[str]:
         for row in conn.execute(

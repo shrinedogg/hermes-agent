@@ -324,6 +324,24 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE""",
+    # ── the never-throwing JSON field reads the SQLite ``json_extract`` predicates port to (a missing
+    #    key or a non-object level degrades to NULL, as SQLite's ``json_extract`` does) ──
+    """CREATE OR REPLACE FUNCTION json_extract_path(value json, key text) RETURNS text AS $$
+BEGIN
+    RETURN (value -> key)::text;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE""",
+    """CREATE OR REPLACE FUNCTION json_extract_path_text(value json, key1 text, key2 text) RETURNS text AS $$
+BEGIN
+    RETURN (value -> key1 -> key2)::text;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE""",
     # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard
@@ -397,7 +415,7 @@ WHEN ((NEW.active = 1 OR NEW.compacted = 1) IS DISTINCT FROM (OLD.active = 1 OR 
 EXECUTE FUNCTION messages_display_visibility_update()""",
     """CREATE OR REPLACE FUNCTION messages_display_visibility_update() RETURNS trigger AS $$
 BEGIN
-    UPDATE messages SET display_order = MIN(NEW.id, COALESCE((
+    UPDATE messages SET display_order = LEAST(NEW.id, COALESCE((
         SELECT display_order FROM messages
         WHERE session_id = NEW.session_id AND id <> NEW.id
           AND (active = 1 OR compacted = 1)

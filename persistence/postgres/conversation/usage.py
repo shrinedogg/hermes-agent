@@ -527,23 +527,23 @@ class PgUsageRepository:
         return [dict(r) for r in rows]
 
     def insight_sessions(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
-        return self._insight_rows("_GET_SESSIONS", started_since, source)
+        return self._insight_rows("GET_SESSIONS", started_since, source)
 
     def insight_tool_result_counts(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
-        return self._insight_rows("_GET_TOOL_NAMES", started_since, source)
+        return self._insight_rows("GET_TOOL_NAMES", started_since, source)
 
     def insight_tool_call_payloads(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
-        return self._insight_rows("_GET_TOOL_CALLS", started_since, source)
+        return self._insight_rows("GET_TOOL_CALLS", started_since, source)
 
     def insight_skill_call_payloads(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
-        return self._insight_rows("_GET_SKILL_CALLS", started_since, source)
+        return self._insight_rows("GET_SKILL_CALLS", started_since, source)
 
     def insight_message_stats(self, *, started_since: float, source: Optional[str] = None) -> dict[str, Any]:
-        rows = self._insight_rows("_GET_MESSAGE_STATS", started_since, source)
+        rows = self._insight_rows("GET_MESSAGE_STATS", started_since, source)
         return rows[0] if rows else {}
 
     def insight_model_usage(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
-        return self._insight_rows("_GET_MODEL_USAGE", started_since, source)
+        return self._insight_rows("GET_MODEL_USAGE", started_since, source)
 
 
 add_stubs(PgUsageRepository, UsageRepository, implemented=(

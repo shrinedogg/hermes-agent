@@ -19,7 +19,7 @@ from persistence import CompressionPublishRefused, Conflict, MessageId, SessionI
 from persistence.conversation.lineage import CompressionChild, LineageRepository
 from persistence.conversation.messages import ConversationMessage, NewMessage, RowStamp
 from persistence.conversation.sessions import SessionRecord
-from persistence.core.errors import AuthorityRefusal
+from persistence.core.errors import AuthorityRefusal, PermanentStoreError
 from persistence.sqlite._state.common import _ended_by_compression, is_automatic_end_reason
 from persistence.sqlite.conversation._store.compression import (
     _CHAIN_CAP, _UNSET_CREATED_SOURCES, _walk_compression_chain)
@@ -58,7 +58,7 @@ _UNSET_ANCESTOR_SQL = """
         SELECT s.parent_session_id, up.n + 1 FROM up JOIN sessions s ON s.id = up.pid
         WHERE s.end_reason = 'compression' AND s.created_source = %s AND up.n < %s
     )
-    SELECT 1 FROM up CROSS JOIN sessions s ON s.id = up.pid
+    SELECT 1 FROM up JOIN sessions s ON s.id = up.pid
     WHERE s.end_reason = 'compression' AND COALESCE(s.created_source, '') IN ('', 'unknown', 'local')
     LIMIT 1
 """
@@ -211,6 +211,13 @@ class PgLineageRepository:
                         watermark_ceiling=int(watermark_ceiling) if watermark_ceiling is not None else None)
             except pg_errors.UniqueViolation as exc:
                 raise Conflict("session", str(child.session_id)) from exc
+            except PermanentStoreError as exc:
+                # A taken child id fails the insert; the transaction's translation turns the raw unique
+                # violation into a permanent store error before this handler runs, so rewrap just that
+                # case as the contract's conflict.
+                if isinstance(exc.__cause__, pg_errors.UniqueViolation):
+                    raise Conflict("session", str(child.session_id)) from exc
+                raise
             except RuntimeError as exc:
                 # The preconditions are plain RuntimeErrors; the typed refusals subclass it.
                 if type(exc) is not RuntimeError:
