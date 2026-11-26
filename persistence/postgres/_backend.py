@@ -211,7 +211,7 @@ def _pool_for(dsn: str) -> ConnectionPool:
     with _POOL_LOCK:
         pool = _POOLS.get(dsn)
         if pool is None:
-            pool = ConnectionPool(conninfo=dsn, min_size=1, max_size=16, timeout=30)
+            pool = ConnectionPool(conninfo=dsn, min_size=1, max_size=64, timeout=30)
             try:
                 pool.open(wait=True)
             except Exception as exc:
@@ -722,12 +722,18 @@ class PostgresStore:
 
     @property
     def owner_profile_name(self) -> Optional[str]:
-        """The profile owning this store: the scope's name (``default`` for the default root, the profile's
-        name for a named profile home), None for a folder outside the profile tree - the SQLite store's
-        own-profile derivation, never a guess."""
+        """The profile owning this store: the name of the home this store's registered location lives in
+        (``default`` for the default root, the profile's name for a named profile home), None for a location
+        outside the profile tree. The reference store derives its owner from its own ``state.db``; here the
+        registered location plays that role - the store's scope may name a different home than the root the
+        store is served under (the test backend switches the root under an open scope), so deriving from the
+        scope would guess. Never a guess: an underivable owner is None."""
+        location = self._backend._stores.get(self.scope.hermes_home_key)
+        if location is None:
+            return None
         from persistence_assembly import store_owner_name
 
-        return store_owner_name(Path(self.scope.profile_dir))
+        return store_owner_name(location.parent)
 
 
 register_health()

@@ -20,7 +20,6 @@ from persistence.conversation.usage import (
 )
 from persistence.conversation.usage import UsageAnalytics
 from persistence.sqlite.conversation.usage import _delta_kwargs
-from persistence.sqlite.conversation.usage_analytics import _LOCAL_SURFACE, _scoped
 from psycopg import errors as pg_errors
 
 from .._backend import PostgresStore, register_repository, translated
@@ -90,6 +89,20 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    cost_status = COALESCE(EXCLUDED.cost_status, session_model_usage.cost_status),
                    cost_source = COALESCE(EXCLUDED.cost_source, session_model_usage.cost_source),
                    last_seen = EXCLUDED.last_seen"""
+
+
+# The source-filter arm the SQLite module builds with ``?`` placeholders cannot be reused here: psycopg
+# only binds ``%s``, so the pair is rebuilt on the PG dialect. The shape is the store's, not the
+# database's: a source filter also matches the gateway's ``local`` rows that surface created
+# (the ``created_source`` arm).
+_PG_LOCAL_SURFACE = " OR ({a}source = 'local' AND {a}created_source = %s)"
+
+
+def _pg_scoped(before: str, after: str = "", *, alias: str = "s.") -> tuple[str, str]:
+    """(unfiltered, source-filtered) query pair sharing one body; the filtered arm takes two
+    source parameters (the explicit source, then the ``created_source`` arm's)."""
+    src = f" AND ({alias}source = %s{_PG_LOCAL_SURFACE.format(a=alias)})"
+    return before + after, before + src + after
 
 
 class PgUsageRepository:
@@ -253,10 +266,15 @@ class PgUsageRepository:
         with translated():
             with store.tx() as conn:
                 # Ensure the row exists: the UPDATE would otherwise silently affect 0 rows when the
-                # creator's insert raced; the first backfill carries the real source.
+                # creator's insert raced; the first backfill carries the real source, and a later
+                # real source replaces the token-accounting guard's ``unknown`` placeholder
+                # (the reference upsert's #111999 rule) - every other surface is kept.
                 conn.execute(
                     "INSERT INTO sessions (id, source, created_source, started_at, model) "
-                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (id) DO UPDATE SET "
+                    "source = CASE WHEN sessions.source = 'unknown' "
+                    "THEN COALESCE(EXCLUDED.source, 'unknown') ELSE sessions.source END",
                     (session_id, source or "unknown", source or "unknown", time.time(), values.get("model")))
                 self._update_token_counts_in_transaction(conn, session_id, absolute=absolute, **values)
 
@@ -342,7 +360,7 @@ class PgUsageRepository:
 
     # ── analytics reads (the SQLite ``UsageAnalytics`` SQL on the PG dialect) ──
 
-    _GET_SESSIONS_ALL, _GET_SESSIONS_WITH_SOURCE = _scoped(
+    _GET_SESSIONS_ALL, _GET_SESSIONS_WITH_SOURCE = _pg_scoped(
         "SELECT id, source, model, started_at, ended_at, "
         "message_count, tool_call_count, input_tokens, output_tokens, "
         "cache_read_tokens, cache_write_tokens, billing_provider, "
@@ -352,14 +370,14 @@ class PgUsageRepository:
         " ORDER BY started_at DESC",
         alias="")
 
-    _GET_TOOL_CALLS_ALL, _GET_TOOL_CALLS_WITH_SOURCE = _scoped(
+    _GET_TOOL_CALLS_ALL, _GET_TOOL_CALLS_WITH_SOURCE = _pg_scoped(
         "SELECT m.session_id, m.tool_calls"
         " FROM messages m"
         " JOIN sessions s ON s.id = m.session_id"
         " WHERE s.started_at >= %s",
         " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL",
     )
-    _GET_SKILL_CALLS_ALL, _GET_SKILL_CALLS_WITH_SOURCE = _scoped(
+    _GET_SKILL_CALLS_ALL, _GET_SKILL_CALLS_WITH_SOURCE = _pg_scoped(
         "SELECT m.tool_calls, m.timestamp"
         " FROM messages m"
         " JOIN sessions s ON s.id = m.session_id"
@@ -368,7 +386,7 @@ class PgUsageRepository:
         " AND (position('skill_view' IN m.tool_calls) > 0"
         " OR position('skill_manage' IN m.tool_calls) > 0)",
     )
-    _GET_TOOL_NAMES_ALL, _GET_TOOL_NAMES_WITH_SOURCE = _scoped(
+    _GET_TOOL_NAMES_ALL, _GET_TOOL_NAMES_WITH_SOURCE = _pg_scoped(
         """SELECT m.session_id, m.tool_name, COUNT(*) AS count
              FROM messages m
              JOIN sessions s ON s.id = m.session_id
@@ -376,7 +394,7 @@ class PgUsageRepository:
         """  AND m.role = 'tool' AND m.tool_name IS NOT NULL
              GROUP BY m.session_id, m.tool_name""",
     )
-    _GET_MESSAGE_STATS_ALL, _GET_MESSAGE_STATS_WITH_SOURCE = _scoped(
+    _GET_MESSAGE_STATS_ALL, _GET_MESSAGE_STATS_WITH_SOURCE = _pg_scoped(
         """SELECT COUNT(*) AS total_messages,
                   SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) AS user_messages,
                   SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) AS assistant_messages,
@@ -385,7 +403,7 @@ class PgUsageRepository:
              JOIN sessions s ON s.id = m.session_id
             WHERE s.started_at >= %s""",
     )
-    _GET_MODEL_USAGE_ALL, _GET_MODEL_USAGE_WITH_SOURCE = _scoped(
+    _GET_MODEL_USAGE_ALL, _GET_MODEL_USAGE_WITH_SOURCE = _pg_scoped(
         "SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url,"
         " u.api_call_count, u.input_tokens, u.output_tokens,"
         " u.cache_read_tokens, u.cache_write_tokens, u.reasoning_tokens,"
@@ -502,7 +520,10 @@ class PgUsageRepository:
                GROUP BY u.model, u.billing_provider
                ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC""",
             started_after)
-        return [dict(r) for r in rows]
+        return [
+            {**dict(r), "estimated_cost": float(r["estimated_cost"] or 0.0), "actual_cost": float(r["actual_cost"] or 0.0),
+             "avg_tokens_per_session": float(r["avg_tokens_per_session"] or 0.0)}
+            for r in rows]
 
     def auxiliary_usage_by_model_task(self, *, started_after: float) -> list[dict[str, Any]]:
         store = self._store
@@ -524,7 +545,9 @@ class PgUsageRepository:
                GROUP BY u.model, u.task, u.billing_provider
                ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC""",
             started_after)
-        return [dict(r) for r in rows]
+        return [
+            {**dict(r), "estimated_cost": float(r["estimated_cost"] or 0.0)}
+            for r in rows]
 
     def insight_sessions(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:
         return self._insight_rows("GET_SESSIONS", started_since, source)

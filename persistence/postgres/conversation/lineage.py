@@ -415,7 +415,8 @@ class PgLineageRepository:
             self._drop_shadowed_checkpoint_rows(conn, session_id, int(live_messages[carrier]["_row_id"]))
 
     def _drop_shadowed_checkpoint_rows(self, conn, session_id: str, carrier_row_id: int) -> None:
-        for row_id, raw in conn.execute(_SHADOWED_CHECKPOINT_ROWS_SQL, (session_id, carrier_row_id)).fetchall():
+        for row in conn.execute(_SHADOWED_CHECKPOINT_ROWS_SQL, (session_id, carrier_row_id)).fetchall():
+            row_id, raw = row["id"], row["codex_reasoning_items"]
             items = _json_or(raw, None)
             if not isinstance(items, list) or not any(_is_checkpoint_item(item) for item in items):
                 continue
