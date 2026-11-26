@@ -884,10 +884,11 @@ class PgMessageRepository:
     def _append_one(self, store: PostgresStore, session_id: SessionId, msg: dict[str, Any], *,
                     turn_lease_holder: Optional[str], turn_lease_ttl_seconds: float) -> None:
         """One transcript write: the guards (with their last session-row step), the insert and the
-        counter bump in one transaction (the store's ``append_batch`` door)."""
+        counter bump in one transaction (the store's ``append_batch`` door, single-row form: the
+        SQLite ``append_message`` keeps the reasoning columns for every role, unlike the copy doors)."""
         with _refusals(store, session_id):
             _writes.append_batch(store, str(session_id), [msg], turn_lease_holder=turn_lease_holder,
-                                 turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                                 turn_lease_ttl_seconds=turn_lease_ttl_seconds, keep_all_reasoning=True)
 
     def _append_detached_result(self, store: PostgresStore, session_id: SessionId, content: str,
                                display_kind: str, metadata: dict[str, Any], match_sql: str,

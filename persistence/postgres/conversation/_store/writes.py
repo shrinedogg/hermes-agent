@@ -49,10 +49,15 @@ __all__ = [
 # ── batch append ──
 
 def _insert_message_rows(conn, session_id: str, messages: list[dict[str, Any]], *,
-                         prune_checkpoints: bool = True) -> tuple[int, int]:
+                         prune_checkpoints: bool = True, keep_all_reasoning: bool = False) -> tuple[int, int]:
     """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``
     (the SQLite ``_insert_message_rows`` port: ``RETURNING id`` instead of ``lastrowid``, display
-    order/identity left to the DDL insert triggers)."""
+    order/identity left to the DDL insert triggers). Never touches sessions.* counters (callers
+    reconcile differently); reasoning kept for assistant rows (the copy/batch doors), or for every
+    role when ``keep_all_reasoning`` (the single-append door: the SQLite ``append_message`` stores the
+    reasoning columns verbatim, whatever the role; only the fork/copy doors drop them for
+    non-assistant rows). A caller that re-archives some rows afterwards passes
+    ``prune_checkpoints=False`` and prunes once they are archived again."""
     now_ts = time.time()
     inserted = tool_calls_total = 0
     batch_tool_index: dict[str, str] = {}
@@ -67,7 +72,7 @@ def _insert_message_rows(conn, session_id: str, messages: list[dict[str, Any]], 
         row = conn.execute(
             _INSERT_MESSAGE_SQL,
             _message_row_params(session_id, role, msg, tool_calls, message_timestamp,
-                               keep_reasoning=role == "assistant"),
+                               keep_reasoning=keep_all_reasoning or role == "assistant"),
         ).fetchone()
         msg["timestamp"] = message_timestamp
         if row is not None:
@@ -95,10 +100,13 @@ def _message_row_params(session_id: str, role: str, msg: dict[str, Any], tool_ca
 
 def append_batch(store, session_id: str, messages: list[dict[str, Any]], *,
                  turn_lease_holder: Optional[str] = None,
-                 turn_lease_ttl_seconds: float = 300.0) -> int:
+                 turn_lease_ttl_seconds: float = 300.0,
+                 keep_all_reasoning: bool = False) -> int:
     """One batch write transaction (the SQLite ``_append_chunk`` port): the guards, the repair-batch
     resolution, the insert and the counter bump, plus the restored-dict row-state stamp (a dict the
-    repair left unwritten takes the newest active row of its role carrying its uid)."""
+    repair left unwritten takes the newest active row of its role carrying its uid).
+    ``keep_all_reasoning``: the single-append door's flag — store the reasoning columns for every role
+    (the batch/copy doors keep them for assistant rows only, as the SQLite doors do)."""
     if not messages:
         return 0
 
@@ -113,7 +121,8 @@ def append_batch(store, session_id: str, messages: list[dict[str, Any]], *,
             serialize_message_fn=partial(_serialize, session_id),
             decode_row_fn=_decoded_repair_row,
         )
-        inserted, tool_calls_total = _insert_message_rows(conn, session_id, inserted_rows)
+        inserted, tool_calls_total = _insert_message_rows(conn, session_id, inserted_rows,
+                                                         keep_all_reasoning=keep_all_reasoning)
         _bump_counters(conn, session_id, inserted, tool_calls_total)
         for msg in messages:
             if msg.get(RESTORED_FROM_STORE) and msg.get("_db_persisted") and "_row_id" not in msg:
