@@ -327,7 +327,7 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
              ELSE convert_from(
                     decode(
                       translate(
-                        replace(regexp_replace(encode(content, 'hex'), '(..)', '\\1~', 'g'),
+                        replace(regexp_replace(encode(content, 'hex'), '(..)', '~\\1~', 'g'),
                                 '~00~', '~20~'),
                         '~', ''),
                       'hex'),
