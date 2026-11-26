@@ -303,6 +303,20 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started ON sessions(created_source, started_at DESC) WHERE source = 'local'",
     # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
+    """CREATE OR REPLACE FUNCTION hermes_json_valid(text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF $1 IS NULL THEN
+    RETURN false;
+  END IF;
+  BEGIN
+    PERFORM ($1)::jsonb;
+    RETURN true;
+  EXCEPTION WHEN invalid_text_representation THEN
+    RETURN false;
+  END;
+END;
+$$""",
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard
 BEFORE DELETE ON sessions
