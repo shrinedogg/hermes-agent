@@ -19,6 +19,7 @@ from persistence.sqlite.conversation._store.rules import CANONICAL_ROW, DB_ROW_S
 
 from .common import (
     _MESSAGE_WRITE_COLUMNS, _decode_payloads, _in_placeholders, _loaded_view_content,
+    _payload_bytes,
 )
 
 _NON_PAYLOAD_COLUMNS = frozenset(
@@ -195,11 +196,12 @@ def resolve_and_repair_transcript_batch(
             # Legacy dict (no digest) over a blank assistant row: the interrupted-stream content repair.
             written = conn.execute(
                 "UPDATE messages SET content = %s WHERE id = %s AND session_id = %s AND content IS NULL",
-                (encode_content_fn(msg.get("content")), target_id, session_id)) \
+                (_payload_bytes(encode_content_fn(msg.get("content"))), target_id, session_id)) \
                 if target_row["content"] is None else \
                 conn.execute(
                     "UPDATE messages SET content = %s WHERE id = %s AND session_id = %s AND content IS NOT DISTINCT FROM %s",
-                    (encode_content_fn(msg.get("content")), target_id, session_id, target_row["content"]))
+                    (_payload_bytes(encode_content_fn(msg.get("content"))), target_id, session_id,
+                     _payload_bytes(target_row["content"])))
             wrote = written.rowcount > 0
         else:
             # Legacy dict over a non-blank assistant row: adopt its content only, never the whole row.

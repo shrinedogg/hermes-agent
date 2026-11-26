@@ -12,7 +12,7 @@ from typing import Any, Callable
 import pytest
 
 from persistence import RewindRefused
-from persistence.conversation.messages import ConversationRequest, NewMessage
+from persistence.conversation.messages import NewMessage
 from persistence.conversation.sessions import NewSession
 from persistence.core.identity import SessionId
 
@@ -46,12 +46,14 @@ def _interpose_plan_reads(backend_name: str, repo, monkeypatch, edit: Callable[[
 
         monkeypatch.setattr(module, "get_messages_as_conversation", read)
     else:
-        real_conversation = repo.read_conversation
+        from persistence.postgres.conversation._store import reads as module
 
-        def read_conversation(sid, request=ConversationRequest()):
-            return edit(list(real_conversation(sid, request)), request.repair_alternation)
+        real = module.get_messages_as_conversation
 
-        monkeypatch.setattr(repo, "read_conversation", read_conversation)
+        def read(store, sid, **kwargs):
+            return edit(real(store, sid, **kwargs), bool(kwargs.get("repair_alternation")))
+
+        monkeypatch.setattr(module, "get_messages_as_conversation", read)
 
 
 def _without_row_ids(rows: list) -> list:
@@ -134,7 +136,9 @@ def test_a_carrier_rewind_without_its_handoff_carries_the_handoff_text(backend_n
         real = module.rewind_to_message
         monkeypatch.setattr(module, "rewind_to_message", lambda *a, **kw: {**real(*a, **kw), "replacement_message_id": None})
     else:
-        real_rewind_to = repo._rewind_to
-        monkeypatch.setattr(repo, "_rewind_to", lambda *a, **kw: (real_rewind_to(*a, **kw)[0], None))
+        from persistence.postgres.conversation._store import rewind as module
+
+        real = module.rewind_to_message
+        monkeypatch.setattr(module, "rewind_to_message", lambda *a, **kw: {**real(*a, **kw), "replacement_message_id": None})
     refused = _refusal(repo)
     assert (refused.reason, str(refused)) == ("handoff_lost", "rewind did not retain its compaction handoff")

@@ -31,10 +31,11 @@ _RESET_END_REASONS_SQL = ", ".join(f"'{reason}'" for reason in _RESET_END_REASON
 def json_marker_sql(expression: str, key: str) -> str:
     """A non-throwing lookup of marker *key* in a JSON TEXT column: the marker's text value, NULL
     when the column is invalid JSON or the key is absent (the SQLite ``_sql_json_extract`` shape on
-    the PG dialect; a JSON string value reads back bare)."""
+    the PG dialect; a JSON string value reads back bare). ``::jsonb ->>`` yields the bare text
+    (``json_extract_path(...)::text`` would yield the quoted JSON form, ``'"value"'``)."""
     return (
         f"(CASE WHEN json_text_valid({expression}) "
-        f"THEN json_extract_path({expression}::json, '{key}')::text END)"
+        f"THEN {expression}::jsonb ->> '{key}' END)"
     )
 
 

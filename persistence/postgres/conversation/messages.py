@@ -315,8 +315,9 @@ class PgMessageRepository:
         msg = _message_dict(message)
         msg.pop("data_use", None)
         msg.pop("_tool_call_uid", None)
-        self._append_one(store, session_id, msg, turn_lease_holder=turn_lease_holder,
-                         turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        with _refusals(store, session_id):
+            self._append_one(store, session_id, msg, turn_lease_holder=turn_lease_holder,
+                             turn_lease_ttl_seconds=turn_lease_ttl_seconds)
         return MessageId(int(msg["_row_id"]))
 
     def append_batch(self, session_id: SessionId, messages: Sequence[NewMessage], *,
@@ -362,9 +363,10 @@ class PgMessageRepository:
             "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'delegation_id'), '') = %s "
             "AND COALESCE(((CASE WHEN m.display_metadata IS NULL OR m.display_metadata = '' "
             "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'delivery_notice'), '') = %s")
-        return MessageId(self._append_detached_result(
-            store, session_id, delivery.content, kind, metadata, match_sql,
-            (str(delegation_id), str(metadata.get("delivery_notice", "")))))
+        with _refusals(store, session_id):
+            return MessageId(self._append_detached_result(
+                store, session_id, delivery.content, kind, metadata, match_sql,
+                (str(delegation_id), str(metadata.get("delivery_notice", "")))))
 
     def append_completion_note(self, session_id: SessionId, admission_id: str, content: str,
                               display_kind: str, metadata: Mapping[str, Any]) -> MessageId:
@@ -374,9 +376,10 @@ class PgMessageRepository:
         match_sql = (
             "COALESCE(((CASE WHEN m.display_metadata IS NULL OR m.display_metadata = '' "
             "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'completion_admission'), '') = %s")
-        return MessageId(self._append_detached_result(
-            store, session_id, content, display_kind, {**dict(metadata), "completion_admission": admission_id},
-            match_sql, (str(admission_id),)))
+        with _refusals(store, session_id):
+            return MessageId(self._append_detached_result(
+                store, session_id, content, display_kind, {**dict(metadata), "completion_admission": admission_id},
+                match_sql, (str(admission_id),)))
 
     def replace_transcript(self, session_id: SessionId, messages: Sequence[NewMessage], mode: ReplaceMode, *,
                            reject_active_turn_lease: bool = False) -> ReplaceResult:

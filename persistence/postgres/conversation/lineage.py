@@ -453,7 +453,7 @@ class PgLineageRepository:
             return
         ph = ", ".join(["%s"] * len(tail_ids))
         conn.execute(
-            """INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name,
+            f"""INSERT INTO messages (session_id, role, content, tool_call_id, tool_calls, tool_name,
                         effect_disposition, timestamp, token_count, finish_reason,
                         reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                         codex_message_items, platform_message_id, observed, _compressed_summary,
@@ -909,32 +909,21 @@ class PgLineageRepository:
         if len(ids) <= 1:
             return ()
         store = self._store
-        segments: dict[str, list[dict[str, object]]] = {}
-        for seg in ids:
-            rows = store.all(
-                "SELECT * FROM messages WHERE session_id = %s AND (active = 1 OR compacted = 1) ORDER BY id",
-                seg)
-            for row in rows:
-                for column in ("content", "api_content", "reasoning_content"):
-                    row[column] = _payload_str(row.get(column))
-            segments[seg] = rows
-        # A carried-forward row (identical display key in a later segment) shows in the later segment
-        # only: mark the last segment holding each key.
-        last_holding: dict[tuple, int] = {}
-        from .messages import _display_dedupe_key
-        for idx, seg in enumerate(ids):
-            for row in segments[seg]:
-                last_holding[_display_dedupe_key(row)] = idx
-        prefix_rows = []
-        for idx, seg in enumerate(ids):
-            if seg == sid:
-                continue  # the session's own rows are not in the prefix
-            for row in segments[seg]:
-                if last_holding[_display_dedupe_key(row)] != idx:
-                    continue  # carried forward: the row now lives in a later segment
-                prefix_rows.append(row)
-        return tuple(ConversationMessage.from_openai_message(_row_to_message_dict(row, summary_flag=True))
-                     for row in prefix_rows)
+        # The shared display read (the SQLite ``get_ancestor_display_prefix`` port): one dedupe over all
+        # segments' display rows, projected through the conversation reader so the dicts carry the wire
+        # surface (a raw row's ``id``/``session_id``/``active`` keys are not replay-projection keys).
+        from ._store.reads import _dedupe_display_generations, _fetch_conversation_rows, _rows_to_conversation
+        rows = _dedupe_display_generations(
+            _fetch_conversation_rows(store, ids, "", with_session_id=True, with_compacted=True),
+            drop_removed=True)
+        ancestor_ids = {int(row["id"]) for row in rows if row["session_id"] != sid and row["id"] is not None}
+        if not ancestor_ids:
+            return ()
+        lineage = _rows_to_conversation(rows, session_id=sid, include_ancestors=True,
+                                        repair_alternation=False, include_row_ids=True)
+        return tuple(ConversationMessage.from_openai_message(
+                       {k: v for k, v in message.items() if k != "_row_id"})
+                     for message in lineage if message.get("_row_id") in ancestor_ids)
 
     def compression_fallback_streak(self, session_id: SessionId) -> int:
         return self._read_session_number("compression_fallback_streak", session_id, int, 0)

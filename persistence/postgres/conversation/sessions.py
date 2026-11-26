@@ -1681,7 +1681,7 @@ _SESSION_ALL_COLS = (
     " rewind_count, archived, auto_archived, pinned, hidden, last_read_at, tool_names,"
     " transcript_revision, prompt_cache_clock, started_at, ended_at, end_reason, message_count,"
     " tool_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,"
-    " reasoning_tokens",
+    " reasoning_tokens"
 )
 
 
@@ -1732,16 +1732,29 @@ def _chain_search_where(where_sql: str, id_needle: str, search_needle: str) -> t
 
 
 def _list_row(row: Mapping) -> dict:
-    """Project a list_sessions_rich row: shape the preview, drop internal ordering columns."""
+    """Project a list_sessions_rich row: shape the preview, drop internal ordering columns; the
+    prompt-store joins resolve over the raw columns, as ``_rich_row`` does for the rich reads."""
     s = dict(row)
+    for column in ("system_prompt", "tool_names"):
+        if f"_{column}_resolved" in s:
+            resolved = s.pop(f"_{column}_resolved")
+            if column in s:
+                s[column] = resolved
     s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
     s.pop("_effective_last_active", None)
     return s
 
 
 def _rich_row(row: Mapping) -> dict:
-    """Session row dict with ``_preview_raw`` shaped into ``preview`` (the SQLite ``_rich_row``)."""
+    """Session row dict with ``_preview_raw`` shaped into ``preview`` (the SQLite ``_rich_row``); the
+    prompt-store joins resolve over the raw columns the way ``_row_to_record`` does for the plain
+    reads, so a prompt moved into the content-addressed store still answers through the rich rows."""
     s = dict(row)
+    for column in ("system_prompt", "tool_names"):
+        if f"_{column}_resolved" in s:
+            resolved = s.pop(f"_{column}_resolved")
+            if column in s:
+                s[column] = resolved
     s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
     return s
 
@@ -1813,7 +1826,7 @@ def list_sessions_rich(
                     FROM sessions s
                     LEFT JOIN chain_max cm ON cm.root_id = s.id
                     {outer_where}
-                    ORDER BY effective_last_active DESC, s.started_at DESC, s.id DESC
+                    ORDER BY effective_last_active DESC NULLS LAST, s.started_at DESC, s.id DESC
                     LIMIT %s OFFSET %s
                 )
                 {select_head}{_last_active("s")} AS last_active,
@@ -1821,7 +1834,7 @@ def list_sessions_rich(
                 FROM page
                 JOIN sessions s ON s.id = page.page_id
                 {prompt_join}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                ORDER BY _effective_last_active DESC NULLS LAST, s.started_at DESC, s.id DESC
             """
         # WHERE binds twice (seed + outer), each on its own connection call.
         rows = store.all(query, *(params + params + id_params + [limit, offset]))
@@ -2061,13 +2074,19 @@ def search_sessions(
         ws_clause, ws_params = _workspace_key_clause(workspace_key)
         where_clauses.append(ws_clause)
         params.extend(ws_params)
-    return [dict(row) for row in store.all(
+    rows = [dict(row) for row in store.all(
         "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
         f"{_last_active('s')} AS last_active "
         "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
         f"{_where_sql(where_clauses, ' ')} "
-        "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT %s OFFSET %s",
+        "ORDER BY last_active DESC NULLS LAST, s.started_at DESC, s.id DESC LIMIT %s OFFSET %s",
         *params, limit, offset)]
+    for s in rows:  # the join's resolved prompt over the raw column (the SQLite read shape)
+        if "_system_prompt_resolved" in s:
+            resolved = s.pop("_system_prompt_resolved")
+            if "system_prompt" in s:
+                s["system_prompt"] = resolved
+    return rows
 
 
 def session_count(
@@ -2734,7 +2753,7 @@ def list_gateway_sessions(
         params.append(platform)
     if active_only:
         query += " AND s.ended_at IS NULL"
-    query += " ORDER BY last_active DESC"
+    query += " ORDER BY last_active DESC NULLS LAST"
     return [_list_row(row) for row in store.all(query, *params)]
 
 
@@ -2918,7 +2937,7 @@ def list_unlinked_telegram_sessions_for_user(
         f"{_last_active('s')} AS last_active "
         "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
         "WHERE s.source = 'telegram' AND s.user_id = %s "
-        "ORDER BY last_active DESC, s.started_at DESC LIMIT %s",
+        "ORDER BY last_active DESC NULLS LAST, s.started_at DESC LIMIT %s",
         str(user_id), int(limit))
     return [_list_row(row) for row in rows]
 
@@ -3788,9 +3807,15 @@ class PgSessionsRepository:
     def records_created_surface(self) -> bool:
         store = self._store
         with refusals(store):
+            if not store.read_only:
+                # The schema is declarative (the current DDL always declares ``created_source``) and is
+                # created lazily at the first write, so a never-written store already carries the surface
+                # (a probe read never creates the schema, so the information_schema query would miss it).
+                return True
             row = store.one(
                 "SELECT 1 FROM information_schema.columns "
-                "WHERE table_schema = current_schema() AND table_name = 'sessions' AND column_name = 'created_source'")
+                "WHERE table_schema = %s AND table_name = 'sessions' AND column_name = 'created_source'",
+                store.schema)
         return row is not None
 
     def last_active(self, session_id: SessionId) -> Optional[float]:

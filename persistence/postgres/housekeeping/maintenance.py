@@ -1230,8 +1230,6 @@ class PgSessionMaintenance:
         session = dict(row)
         session["system_prompt"] = session.pop("_system_prompt_resolved", None)
         session["tool_names"] = session.pop("_tool_names_resolved", None)
-        session["last_active"] = store.scalar(
-            f"SELECT {session_last_active_sql('s')} AS v FROM sessions s WHERE s.id = %s", session_id)
         return session
 
     @staticmethod
@@ -1253,7 +1251,9 @@ class PgSessionMaintenance:
     def _with_messages(store, session: dict[str, Any], include_compacted: bool = False,
                        include_inactive: bool = False) -> SessionExport:
         messages = PgSessionMaintenance._session_messages(store, session["id"], include_compacted, include_inactive)
-        return SessionExport(session=_export_row(session, session.get("last_active")),
+        # Contract: a single-session export row leaves ``last_active`` unset (``export_all`` sets it);
+        # an unset extra has no key in the row dict.
+        return SessionExport(session=_export_row(session, None),
                              messages=tuple(map(_transcript_row, messages)))
 
     def _export_session(self, store, session_id: SessionId, include_compacted: bool = False,

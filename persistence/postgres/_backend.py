@@ -45,8 +45,9 @@ from psycopg_pool import ConnectionPool
 from persistence import (
     AwaitableStore, CompressionBusy, CompressionClosed, CompressionInProgress, DiskFull, ExportTooLarge,
     HeldRowRewritten, MalformedSchema, PermanentStoreError, PersistenceCapabilities,
-    PersistenceError, ProfileScope, PruneRowStale, PruneRowUnresolved, SessionWriteGuarded, StoreContention,
-    StoreQuarantined, StoreReplaced, StoreUnavailable, TransientStoreError, TurnLeaseLost,
+    PersistenceError, ProfileScope, PruneRowStale, PruneRowUnresolved, SessionRowMissing,
+    SessionWriteGuarded, StoreContention, StoreQuarantined, StoreReplaced, StoreUnavailable,
+    TransientStoreError, TurnLeaseLost,
 )
 from persistence.conversation.messages import ReadCheck, ResumeTooLarge, RewindTargetUnavailable
 from persistence.core.identity import SessionId
@@ -158,7 +159,16 @@ def _pg_error(exc: Exception) -> PersistenceError:
         return DiskFull(str(exc))
     if isinstance(exc, psycopg.errors.ReadOnlySqlTransaction):
         return PermanentStoreError(f"read-only store refuses the write: {exc}")
-    if sqlstate in ("23503", "23505", "23514", "23502", "23506"):
+    if sqlstate == "23503":
+        # The messages' session FK: the SQLite reference's ``FOREIGN KEY constraint failed`` maps to the
+        # named refusal (a write into a session with no row), so a PostgreSQL violation of the same
+        # constraint must raise the same error, not the generic integrity error.
+        if (getattr(getattr(exc, "diag", None), "constraint_name", None) or "") == "messages_session_id_fkey":
+            match = re.search(r"Key \(session_id\)=\(([^)]*)\)", str(exc))
+            if match is not None:
+                return SessionRowMissing(SessionId(match.group(1)))
+        return PermanentStoreError(str(exc))
+    if sqlstate in ("23505", "23514", "23502", "23506"):
         return PermanentStoreError(str(exc))
     if sqlstate in ("42P01", "42P07", "42703", "42809", "42883", "42601", "42804"):
         return MalformedSchema(str(exc))

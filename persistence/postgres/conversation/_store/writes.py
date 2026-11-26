@@ -224,12 +224,11 @@ def _replace_in_transaction(conn, session_id: str, messages: list[dict[str, Any]
                                        reject_active_turn_lease=True,
                                        reject_active_compression_lock=True)
     else:
+        # No pre-check for the session row here (the SQLite reference's non-fenced replace has none):
+        # an empty replace into an absent session is a no-op, and a real insert into one still fails
+        # the messages' session FK, which maps to ``SessionRowMissing``.
         if _ended(conn, session_id):
             raise CompressionSessionClosedError(session_id)
-        # The lease-fenced guard's last step, so a closed session still wins over a missing one.
-        if conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is None:
-            from persistence import SessionRowMissing, SessionId
-            raise SessionRowMissing(SessionId(session_id))
     kept = kept_tool_calls = 0
     if archive_dropped:
         # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose id
