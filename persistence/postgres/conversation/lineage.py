@@ -318,7 +318,7 @@ class PgLineageRepository:
                    profile_name, user_id, session_key, chat_id, chat_type,
                    thread_id, display_name, origin_json, pinned, started_at,
                    archived, auto_archived
-               ) VALUES (%s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+               ) VALUES (%s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 child_session_id, source, created_source, model, json.dumps(config) if config else None,
                 prompt_hash, parent["tool_names"], parent_session_id,
@@ -389,8 +389,8 @@ class PgLineageRepository:
                     params[i] = None
             cur = conn.execute(_INSERT_MESSAGE_SQL, tuple(params))
             msg["timestamp"] = message_timestamp
-            if cur.lastrowid is not None:
-                msg["_row_id"] = int(cur.lastrowid)
+            if (row := cur.fetchone()) is not None:
+                msg["_row_id"] = int(row["id"])
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6
@@ -879,7 +879,7 @@ class PgLineageRepository:
         rows = store.all(
             f"""SELECT s.id, s.end_reason,
                        (SELECT json_extract_path_text(m.value::json, 'entry', 'session_id') FROM state_meta m
-                        WHERE m.key = '{POLICY_PREFIX}' || s.id AND json_valid(m.value)) AS entry
+                        WHERE m.key = '{POLICY_PREFIX}' || s.id AND json_text_valid(m.value)) AS entry
                 FROM sessions s WHERE s.id IN ({ph})""", *ids)
         out: dict[str, str] = {}
         for row in rows:

@@ -49,7 +49,7 @@ def _token_update_sql(delta: bool) -> str:
         "UPDATE sessions SET\n" + counters
         + f"""                   estimated_cost_usd = {estimated},
                    actual_cost_usd = CASE
-                       WHEN %s IS NULL THEN actual_cost_usd
+                       WHEN %s::double precision IS NULL THEN actual_cost_usd
                        ELSE {add0("actual_cost_usd")}
                    END,
                    cost_status = COALESCE(%s, cost_status),
@@ -76,7 +76,7 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
                    estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
                    first_seen, last_seen
-               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
                DO UPDATE SET
                    api_call_count = session_model_usage.api_call_count + EXCLUDED.api_call_count,
@@ -171,12 +171,14 @@ class PgUsageRepository:
         if not query.include_archived:
             where.append("COALESCE(archived, 0) = 0")
         row = store.one(
-            f"""SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
-                       COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
+            f"""SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0) AS tokens,
+                       COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0) AS cost_usd
                 FROM sessions
                 WHERE {' AND '.join(where)}""", *params)
-        return UsageTotals(tokens=int(row["coalesce"] if "coalesce" in row else 0) if row else 0,
-                          cost_usd=0.0)
+        if not row:
+            return UsageTotals(tokens=0, cost_usd=0.0)
+        return UsageTotals(tokens=int(row["tokens"] or 0),
+                          cost_usd=float(row["cost_usd"] or 0.0))
 
     def auxiliary_usage_by_task(self, session_id: SessionId) -> Mapping[str, AuxiliaryTaskUsage]:
         store = self._store
@@ -415,7 +417,7 @@ class PgUsageRepository:
                       COUNT(*) AS sessions,
                       SUM(COALESCE(api_call_count, 0)) AS api_calls
                FROM sessions WHERE started_at > %s
-               GROUP BY day ORDER BY day""", (started_after,))
+               GROUP BY day ORDER BY day""", started_after)
         return [dict(r) for r in rows]
 
     def session_usage_by_model(self, *, started_after: float) -> list[dict[str, Any]]:
@@ -429,7 +431,7 @@ class PgUsageRepository:
                       SUM(COALESCE(api_call_count, 0)) AS api_calls
                FROM sessions WHERE started_at > %s AND model IS NOT NULL
                GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC""",
-            (started_after,))
+            started_after)
         return [dict(r) for r in rows]
 
     def session_usage_totals(self, *, started_after: float, model_rows_only: bool = False) -> dict[str, Any]:
@@ -444,7 +446,7 @@ class PgUsageRepository:
                      COALESCE(SUM(actual_cost_usd), 0) AS total_actual_cost,
                      COUNT(*) AS total_sessions,
                      SUM(COALESCE(api_call_count, 0)) AS total_api_calls
-               FROM sessions WHERE started_at > %s""" + extra, (started_after,))
+               FROM sessions WHERE started_at > %s""" + extra, started_after)
         return dict(row) if row else {}
 
     def session_usage_by_route(self, *, started_after: float) -> list[dict[str, Any]]:
@@ -466,7 +468,7 @@ class PgUsageRepository:
                FROM sessions WHERE started_at > %s AND model IS NOT NULL AND model != ''
                GROUP BY model, billing_provider
                ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC""",
-            (started_after,))
+            started_after)
         return [dict(r) for r in rows]
 
     def session_tool_calls_by_route(self, *, started_after: float) -> list[dict[str, Any]]:
@@ -475,7 +477,7 @@ class PgUsageRepository:
             """SELECT model, billing_provider, SUM(COALESCE(tool_call_count, 0)) AS tool_calls
                FROM sessions WHERE started_at > %s AND model IS NOT NULL AND model != ''
                GROUP BY model, billing_provider""",
-            (started_after,))
+            started_after)
         return [dict(r) for r in rows]
 
     def call_usage_by_route(self, *, started_after: float) -> list[dict[str, Any]]:
@@ -499,7 +501,7 @@ class PgUsageRepository:
                  AND u.task = ''
                GROUP BY u.model, u.billing_provider
                ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC""",
-            (started_after,))
+            started_after)
         return [dict(r) for r in rows]
 
     def auxiliary_usage_by_model_task(self, *, started_after: float) -> list[dict[str, Any]]:
@@ -521,7 +523,7 @@ class PgUsageRepository:
                WHERE s.started_at > %s AND u.task != ''
                GROUP BY u.model, u.task, u.billing_provider
                ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC""",
-            (started_after,))
+            started_after)
         return [dict(r) for r in rows]
 
     def insight_sessions(self, *, started_since: float, source: Optional[str] = None) -> list[dict[str, Any]]:

@@ -33,7 +33,7 @@ def json_marker_sql(expression: str, key: str) -> str:
     when the column is invalid JSON or the key is absent (the SQLite ``_sql_json_extract`` shape on
     the PG dialect; a JSON string value reads back bare)."""
     return (
-        f"(CASE WHEN json_valid({expression}) "
+        f"(CASE WHEN json_text_valid({expression}) "
         f"THEN json_extract_path({expression}::json, '{key}')::text END)"
     )
 
@@ -87,7 +87,8 @@ def session_last_active_sql(alias: str = "s") -> str:
     in_window = f"BETWEEN {EPOCH_MIN} AND {EPOCH_MAX}"
     return (
         f"COALESCE((SELECT MAX(v) FROM (SELECT {alias}.last_activity_at AS v UNION ALL "
-        f"(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = {alias}.id)) _lv "
+        f"(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = {alias}.id "
+        f"AND m.timestamp {in_window})) _lv "
         f"WHERE _lv.v {in_window}), "
         f"(CASE WHEN {alias}.started_at {in_window} THEN {alias}.started_at END))"
     )

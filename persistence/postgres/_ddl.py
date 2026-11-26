@@ -302,6 +302,28 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_tool_names ON sessions(tool_names)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started ON sessions(created_source, started_at DESC) WHERE source = 'local'",
+    # ── JSON text helpers: the non-throwing validity/field reads the SQLite ``json_valid``/``json_extract``
+    #    predicates port to (PostgreSQL has no ``json_valid(text)``; a bad ``::jsonb`` cast raises, so the
+    #    helpers catch and degrade instead) ──
+    """CREATE OR REPLACE FUNCTION json_text_valid(value text) RETURNS boolean AS $$
+BEGIN
+    PERFORM jsonb_typeof(value::jsonb);
+    RETURN TRUE;
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE""",
+    """CREATE OR REPLACE FUNCTION json_text_field_number(value text, field text) RETURNS double precision AS $$
+BEGIN
+    BEGIN
+        RETURN (value::jsonb -> field)::double precision;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN NULL;
+    END;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE""",
     # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard
@@ -347,7 +369,7 @@ WHEN (NEW.message_uid IS NULL)
 EXECUTE FUNCTION messages_message_uid_insert()""",
     """CREATE OR REPLACE FUNCTION messages_message_uid_insert() RETURNS trigger AS $$
 BEGIN
-    UPDATE messages SET message_uid = lower(to_hex(gen_random_uuid()::bytea)) WHERE id = NEW.id;
+    UPDATE messages SET message_uid = replace(gen_random_uuid()::text, '-', '') WHERE id = NEW.id;
     RETURN NULL;
 END; $$ LANGUAGE plpgsql""",
     """DROP TRIGGER IF EXISTS messages_display_order_insert ON messages
