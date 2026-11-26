@@ -55,6 +55,16 @@ from ._store.common import _check_transcript_write_guards, _ensure_display_index
 from ._store.common import CONTENT_TEXT_LEN
 from ._store.common import _parse_tool_calls as _parse_tool_calls_local
 from ._store.common import _row_to_message_dict as _store_row_to_message_dict
+# Cross-repo surface: the lineage/usage/maintenance ports import these helpers from this module (the
+# stage-0 base surface); they now live in ``._store.common``.
+from ._store.common import (
+    _display_dedupe_key,
+    _encode_content,
+    _is_explicit_fork_child_row,
+    _payload_bytes,
+    _row_to_message_dict,
+    _scrub,
+)
 from ._store.common import _stamp_tool_call_uids as _stamp_tool_call_uids_local
 from ._store.prune_rewrite import rewrite_pruned_rows as _store_rewrite_pruned_rows
 from ._store.prune_rewrite import rewritten_held_row_ids as _store_rewritten_held_row_ids
