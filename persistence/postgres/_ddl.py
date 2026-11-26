@@ -302,21 +302,7 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_tool_names ON sessions(tool_names)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started ON sessions(created_source, started_at DESC) WHERE source = 'local'",
-    # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
-    """CREATE OR REPLACE FUNCTION hermes_json_valid(text) RETURNS boolean
-LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
-BEGIN
-  IF $1 IS NULL THEN
-    RETURN false;
-  END IF;
-  BEGIN
-    PERFORM ($1)::jsonb;
-    RETURN true;
-  EXCEPTION WHEN invalid_text_representation THEN
-    RETURN false;
-  END;
-END;
-$$""",
+    # ── NUL-safe bytea-to-text (the message payload is bytea and may carry a leading 0x00 JSON sentinel) ──
     # ``convert_from`` on this server rejects a NUL byte inside the source bytea (``invalid byte
     # sequence for encoding "UTF8": 0x00``), and PostgreSQL ships no bytea string-substitution
     # (no ``replace``/``translate`` over bytea), so a NUL-safe bytea-to-text conversion is its own
@@ -334,6 +320,35 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
                     'UTF8')
              END
 $$""",
+    # ── SQLite ``length(content)`` twin over bytea: characters (bytes) before the first NUL. SQLite's
+    # ``length()`` treats the 0x00 JSON sentinel as a C-string terminator, so a sentinel-prefixed
+    # structured payload has length 0 and a plain-text payload has its full byte length. Walk the hex
+    # tiled form (``~XX~`` per byte, so ``~00~`` only matches a whole NUL byte) and count the ``~XX~``
+    # groups before the first ``~00~``: each group is 4 chars, so ``len(prefix) / 4``.
+    """CREATE OR REPLACE FUNCTION hermes_content_text_len(payload bytea) RETURNS int
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN payload IS NULL OR length(payload) = 0 THEN 0
+             ELSE length(split_part(regexp_replace(encode(payload, 'hex'), '(..)', '~\\1~', 'g'),
+                                    '~00~', 1)) / 4
+             END
+$$""",
+    # ── JSON validity helper (the SQLite ``json_valid`` twin: Postgres has no ``json_valid``, a
+    # bad ``::jsonb`` cast raises, so the helper catches and degrades) ──
+    """CREATE OR REPLACE FUNCTION hermes_json_valid(text) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+  IF $1 IS NULL THEN
+    RETURN false;
+  END IF;
+  BEGIN
+    PERFORM ($1)::jsonb;
+    RETURN true;
+  EXCEPTION WHEN invalid_text_representation THEN
+    RETURN false;
+  END;
+END;
+$$""",
+    # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard
 BEFORE DELETE ON sessions
@@ -406,7 +421,7 @@ WHEN ((NEW.active = 1 OR NEW.compacted = 1) IS DISTINCT FROM (OLD.active = 1 OR 
 EXECUTE FUNCTION messages_display_visibility_update()""",
     """CREATE OR REPLACE FUNCTION messages_display_visibility_update() RETURNS trigger AS $$
 BEGIN
-    UPDATE messages SET display_order = MIN(NEW.id, COALESCE((
+    UPDATE messages SET display_order = LEAST(NEW.id, COALESCE((
         SELECT display_order FROM messages
         WHERE session_id = NEW.session_id AND id <> NEW.id
           AND (active = 1 OR compacted = 1)
