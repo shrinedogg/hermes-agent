@@ -23,8 +23,9 @@ from .sessions_pg import _merge_model_config_json
 __all__ = ["held_row_mismatches", "rewrite_pruned_rows", "rewritten_held_row_ids"]
 
 # Every messages column except the twin's fixed ones (the SQLite ``_message_column_names`` twin;
-# Postgres has no PRAGMA table_info, so the DDL column list is inlined).
-_MESSAGE_ROW_COLUMNS = _MESSAGE_WRITE_COLUMNS
+# Postgres has no PRAGMA table_info, so the DDL column list is inlined). The insert's ``active`` is a
+# SQL literal, not a bound value, so it is dropped from the column<->value alignment.
+_MESSAGE_ROW_COLUMNS = tuple(c for c in _MESSAGE_WRITE_COLUMNS if c != "active")
 
 _ALL_MESSAGE_COLUMNS = (
     "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
@@ -250,19 +251,20 @@ def rewrite_pruned_rows(store, session_id: str, changes: list[tuple[dict[str, An
                 f"SELECT {twin_columns}, 0, 1 FROM messages WHERE id = %s RETURNING id", (row_id,)).fetchone()["id"]
             # The content UPDATE fires the identity trigger, which nulls the slot of the live row and of
             # every visible row sharing its old identity: the twin and any earlier generation's copies.
-            peers = conn.execute(
+            peers = [(r["id"], r["display_order"]) for r in conn.execute(
                 "SELECT id, display_order FROM messages WHERE session_id = %s AND id <> %s "
                 "AND display_identity = %s AND (active = 1 OR compacted = 1)",
-                (session_id, row_id, identity)).fetchall() if identity is not None else [(twin_id, order)]
+                (session_id, row_id, identity)).fetchall()] if identity is not None else [(twin_id, order)]
             conn.execute(f"UPDATE messages SET {', '.join(f'{column} = %s' for column in columns)} WHERE id = %s",
                          [*values, row_id])
-            # The superseded bodies keep their identity and slot. The live row takes the identity of
-            # what it now stores, so a later compaction's copy of it joins the same slot, and keeps
-            # the slot. The page shows one row per display_order, preferring the live one.
+            # dict rows iterate their keys, so the fetched rows are flattened to (id, order) tuples.
             for peer_id, peer_order in peers:
                 conn.execute(
                     "UPDATE messages SET display_identity = %s, display_order = %s WHERE id = %s",
                     (identity, order if peer_order is None else peer_order, peer_id))
+            # The superseded bodies keep their identity and slot. The live row takes the identity of
+            # what it now stores, so a later compaction's copy of it joins the same slot, and keeps
+            # the slot. The page shows one row per display_order, preferring the live one.
             live = conn.execute(
                 "SELECT role, content, timestamp, tool_call_id, tool_calls, tool_name, display_kind, "
                 "display_metadata FROM messages WHERE id = %s", (row_id,)).fetchone()

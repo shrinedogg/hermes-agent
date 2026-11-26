@@ -302,6 +302,36 @@ STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_sessions_tool_names ON sessions(tool_names)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started ON sessions(created_source, started_at DESC) WHERE source = 'local'",
+    # ── NUL-safe bytea-to-text (the message payload is bytea and may carry a leading 0x00 JSON sentinel) ──
+    # ``convert_from`` on this server rejects a NUL byte inside the source bytea (``invalid byte
+    # sequence for encoding "UTF8": 0x00``), and PostgreSQL ships no bytea string-substitution
+    # (no ``replace``/``translate`` over bytea), so a NUL-safe bytea-to-text conversion is its own
+    # function: walk the hex pair by pair, map each ``00`` pair to ``20`` (space), re-decode.
+    """CREATE OR REPLACE FUNCTION hermes_nul_safe_text(content bytea) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN content IS NULL THEN NULL
+             ELSE convert_from(
+                    decode(
+                      translate(
+                        replace(regexp_replace(encode(content, 'hex'), '(..)', '~\\1~', 'g'),
+                                '~00~', '~20~'),
+                        '~', ''),
+                      'hex'),
+                    'UTF8')
+             END
+$$""",
+    # ── SQLite ``length(content)`` twin over bytea: characters (bytes) before the first NUL. SQLite's
+    # ``length()`` treats the 0x00 JSON sentinel as a C-string terminator, so a sentinel-prefixed
+    # structured payload has length 0 and a plain-text payload has its full byte length. Walk the hex
+    # tiled form (``~XX~`` per byte, so ``~00~`` only matches a whole NUL byte) and count the ``~XX~``
+    # groups before the first ``~00~``: each group is 4 chars, so ``len(prefix) / 4``.
+    """CREATE OR REPLACE FUNCTION hermes_content_text_len(payload bytea) RETURNS int
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE WHEN payload IS NULL OR length(payload) = 0 THEN 0
+             ELSE length(split_part(regexp_replace(encode(payload, 'hex'), '(..)', '~\\1~', 'g'),
+                                    '~00~', 1)) / 4
+             END
+$$""",
     # ── triggers (mirror the SQLite triggers verbatim; the PL/pgSQL bodies keep the invariant semantics) ──
     """DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard ON sessions
 CREATE TRIGGER sessions_runtime_ledger_delete_guard

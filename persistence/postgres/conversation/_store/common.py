@@ -14,7 +14,8 @@ from typing import Any, Mapping, Optional
 
 from process_identity import holder_process_is_dead
 from session_rules.turns import (
-    MODEL_ONLY_DISPLAY_METADATA_KEY, coalesce_tool_call_id, index_tool_call_uids, message_uid_or_none,
+    MODEL_ONLY_DISPLAY_METADATA_KEY, TOOL_CALL_UIDS, coalesce_tool_call_id, index_tool_call_uids,
+    message_uid_or_none,
     mint_uid, resolve_tool_call_uid, sanitize_context, split_user_originated_turn,
 )
 from persistence import CompressionClosed, SessionRowMissing, SessionId, TurnLeaseLost
@@ -73,10 +74,16 @@ def _in_placeholders(items) -> str:
     return ", ".join(["%s"] * count) if count else "NULL"
 
 
-# ── BYTEA payload columns: text work through convert_from ──
+# ── BYTEA payload columns: text work through hermes_nul_safe_text (NUL-safe: convert_from rejects
+# the 0x00 JSON sentinel byte; the DDL function substitutes it with a space, 1:1 in length) ──
 
-CONTENT_TEXT = "convert_from(content, 'UTF8')"
-API_CONTENT_TEXT = "convert_from(api_content, 'UTF8')"
+CONTENT_TEXT = "hermes_nul_safe_text(content)"
+API_CONTENT_TEXT = "hermes_nul_safe_text(api_content)"
+# SQLite ``length(content)`` twin for a BYTEA payload: SQLite's ``length()`` treats the 0x00 JSON
+# sentinel as a C-string terminator (it counts only the characters before the first NUL), so a
+# sentinel-prefixed structured row has length 0 and a plain-text row has its full byte length.
+# (``hermes_nul_safe_text(...) <> ''`` diverges: it counts the sentinel payload as text.)
+CONTENT_TEXT_LEN = "hermes_content_text_len(content)"
 
 
 def _payload_bytes(value: Any) -> Optional[bytes]:
@@ -473,7 +480,7 @@ def _stamp_tool_call_uids(msg: dict[str, Any], tool_calls: Any, batch_index: dic
             if call_id and call_id not in uids:
                 uids[call_id] = mint_uid()
         if uids:
-            msg["tool_call_uids"] = uids
+            msg[TOOL_CALL_UIDS] = uids
         index_tool_call_uids(batch_index, msg)
     elif role == "user":
         batch_index.clear()
@@ -677,8 +684,9 @@ def _prune_shadowed_checkpoints(conn, session_id: str, live_messages: list[dict[
     """Keep only the newest checkpoint among *live_messages* (inserted rows carrying ``_row_id``)."""
     carrier = _newest_checkpoint_carrier(live_messages, "codex_reasoning_items")
     if carrier >= 0 and isinstance(live_messages[carrier].get("_row_id"), int):
-        for row_id, raw in conn.execute(
+        for row in conn.execute(
                 _SHADOWED_CHECKPOINT_ROWS_SQL, (session_id, live_messages[carrier]["_row_id"])).fetchall():
+            row_id, raw = row["id"], row["codex_reasoning_items"]
             items = _json_or(raw, None, "Ignoring malformed codex_reasoning_items on message row")
             if not isinstance(items, list) or not any(_is_checkpoint_item(item) for item in items):
                 continue

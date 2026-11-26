@@ -228,11 +228,10 @@ def find_pr_url_messages(store, session_ids: list[str]) -> list[dict[str, Any]]:
         rows = store.all(
             """SELECT session_id, content FROM messages
                     WHERE session_id IN (""" + _in_placeholders(len(chunk)) + """)
-                      AND role = 'tool' AND convert_from(content, 'UTF8') LIKE '%%/pull/%%'
+                      AND role = 'tool' AND hermes_nul_safe_text(content) ILIKE '%%/pull/%%'
                     ORDER BY id ASC""",
             *chunk)
-        out.extend({"session_id": row["session_id"], "content": _json_value_or(
-            _decode_payloads(row)["content"], None, "pr-url hit")} for row in rows)
+        out.extend({"session_id": row["session_id"], "content": _decode_payloads(row)["content"]} for row in rows)
     return out
 
 
@@ -501,7 +500,7 @@ def latest_message_row_id(store, session_id: str, *, role: str = "user", offset:
     trimmed as UTF-8 text)."""
     if not session_id or role not in {"user", "assistant"} or offset < 0:
         return None
-    text_filter = "AND content IS NOT NULL AND TRIM(convert_from(content, 'UTF8')) <> '' " if require_text else ""
+    text_filter = "AND content IS NOT NULL AND TRIM(hermes_nul_safe_text(content)) <> '' " if require_text else ""
     row = store.one(
         "SELECT id FROM messages WHERE session_id = %s AND role = %s "
         f"AND active = 1 {text_filter}ORDER BY id DESC LIMIT 1 OFFSET %s",

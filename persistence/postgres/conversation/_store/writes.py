@@ -643,9 +643,10 @@ def restore_compression_failure_cooldown_row(store, session_id: str, row: Mappin
 
 def purge_stale_tool_call_markers(store, *, dry_run: bool = False, backup: bool = True) -> dict[str, Any]:
     """Permanently clear bare tool-call marker content (the SQLite ``purge_stale_tool_call_markers``
-    port; the marker regex is applied in Python over the decoded content). PostgreSQL has no
-    ``VACUUM INTO`` physical backup: the report's ``backup_path`` is always ``None`` (recorded for the
-    stage-1 review; a logical dump is a stage-6 maintenance concern)."""
+    port; the marker regex is applied in Python over the decoded content). PostgreSQL has no physical
+    database file to copy, so the ``backup`` snapshot is a logical dump of the store schema (every row
+    of every table, JSON lines) written before the write; a full ``pg_dump`` is a stage-6 maintenance
+    concern."""
     def _find_affected(conn) -> list[int]:
         ids = []
         for row in conn.execute(
@@ -656,14 +657,36 @@ def purge_stale_tool_call_markers(store, *, dry_run: bool = False, backup: bool 
                 ids.append(int(row["id"]))
         return ids
 
-    affected_ids = store.all("SELECT 1 FROM messages LIMIT 1")
+    def _logical_backup(conn) -> str:
+        import base64, os, tempfile
+        tables = [r["table_name"] for r in conn.execute(
+                "SELECT table_name FROM information_schema.tables"
+                " WHERE table_schema = %s AND table_type = 'BASE TABLE' ORDER BY table_name",
+                (store.schema,)).fetchall()]
+
+        def _jsonable(value: Any) -> Any:
+            if isinstance(value, (bytes, bytearray)):
+                return {"__bytea__": base64.b64encode(bytes(value)).decode("ascii")}
+            return value
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        path = os.path.join(tempfile.gettempdir(),
+                            f"hermes-pg-pre-clean-markers-backup-{store.schema}-{stamp}.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"schema": store.schema, "type": "hermes postgres pre-write backup"}) + "\n")
+            for table in tables:
+                for row in conn.execute(f'SELECT * FROM "{table}"').fetchall():
+                    fh.write(json.dumps({"table": table, "row": {k: _jsonable(v) for k, v in row.items()}},
+                                       default=str) + "\n")
+        return path
+
     with store.tx() as conn:
         found = _find_affected(conn)
         if dry_run or not found:
             return {"dry_run": dry_run, "rows_affected": len(found), "row_ids": found, "backup_path": None}
+        backup_path = _logical_backup(conn) if backup else None
         conn.execute(f"UPDATE messages SET content = %s WHERE id IN ({_in_placeholders(found)})",
                      [b""] + found)
-        return {"dry_run": dry_run, "rows_affected": len(found), "row_ids": found, "backup_path": None}
+        return {"dry_run": dry_run, "rows_affected": len(found), "row_ids": found, "backup_path": backup_path}
 
 
 def _payload_str_value(value: Any) -> Optional[str]:
