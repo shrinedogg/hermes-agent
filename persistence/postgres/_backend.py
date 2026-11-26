@@ -43,12 +43,22 @@ import psycopg.rows
 from psycopg_pool import ConnectionPool
 
 from persistence import (
-    AwaitableStore, DiskFull, MalformedSchema, PermanentStoreError, PersistenceCapabilities,
-    PersistenceError, ProfileScope, StoreContention, StoreQuarantined, StoreReplaced, StoreUnavailable,
-    TransientStoreError,
+    AwaitableStore, CompressionBusy, CompressionClosed, CompressionInProgress, DiskFull, ExportTooLarge,
+    HeldRowRewritten, MalformedSchema, PermanentStoreError, PersistenceCapabilities,
+    PersistenceError, ProfileScope, PruneRowStale, PruneRowUnresolved, SessionWriteGuarded, StoreContention,
+    StoreQuarantined, StoreReplaced, StoreUnavailable, TransientStoreError, TurnLeaseLost,
 )
+from persistence.conversation.messages import ReadCheck, ResumeTooLarge, RewindTargetUnavailable
+from persistence.core.identity import SessionId
 from persistence.core.admin import AdminUnsupported, ProfileRepairAdmin, StoreAdmin
 from persistence.core.health import StorageProbe, StorageState
+from persistence.sqlite._state.errors import (
+    CompressionSessionBusyError, CompressionSessionClosedError, HeldRowRewrittenError,
+    PruneRowStaleError, PruneRowUnresolvedError, SessionActiveWriteGuardError,
+    SessionCompressionInProgressError, SessionTurnLeaseLostError,
+)
+from persistence.sqlite.conversation._store.core import SessionExportTooLargeError, SessionResumeTooLargeError
+from persistence.sqlite.conversation._store.rewind import RewindTargetUnavailableError
 
 from . import _ddl
 
@@ -60,6 +70,7 @@ __all__ = [
     "PostgresBackend",
     "PostgresStore",
     "PostgresStorageHealth",
+    "refusals",
     "register_repository",
     "schema_for_home",
     "translated",
@@ -175,6 +186,85 @@ def translated() -> Iterator[None]:
         raise _pg_error(exc) from exc
     except (psycopg_pool.PoolTimeout, psycopg_pool.PoolClosed) as exc:
         raise _pg_error(exc) from exc
+
+
+_COMPRESSION_TIP_STEP_SQL = """
+    SELECT child.id
+    FROM sessions parent
+    JOIN sessions child ON child.parent_session_id = parent.id
+    WHERE parent.id = %s
+      AND parent.end_reason = 'compression'
+      AND COALESCE((CASE WHEN child.model_config IS NULL OR child.model_config = '' THEN '{}'::jsonb
+                         ELSE child.model_config::jsonb END) ->> '_branched_from', '') = ''
+      AND COALESCE((CASE WHEN child.model_config IS NULL OR child.model_config = '' THEN '{}'::jsonb
+                         ELSE child.model_config::jsonb END) ->> '_delegate_from', '') = ''
+      AND COALESCE((CASE WHEN child.model_config IS NULL OR child.model_config = '' THEN '{}'::jsonb
+                         ELSE child.model_config::jsonb END) ->> '_reset_from', '') = ''
+      AND COALESCE(child.source, '') != 'tool'
+    ORDER BY
+      CASE WHEN child.end_reason = 'compression' THEN 0
+           WHEN child.ended_at IS NULL THEN 1
+           ELSE 2 END,
+      COALESCE(child.last_activity_at,
+               (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = child.id),
+               child.started_at) DESC,
+      child.started_at DESC, child.id DESC
+    LIMIT 1
+"""
+
+
+def _compression_tip(store: "PostgresStore", session_id: str) -> str:
+    """The live tip of ``session_id``'s compression chain (the SQLite ``get_compression_tip`` port: the
+    input id when no continuation exists), walked over the store's read path."""
+    chain = [session_id]
+    current = session_id
+    seen = {session_id}
+    for _ in range(100):  # defensive bound; ``seen`` guards cycles
+        row = store.one(_COMPRESSION_TIP_STEP_SQL, current)
+        if row is None:
+            break
+        child = str(row["id"])
+        if child in seen:
+            break
+        seen.add(child)
+        chain.append(child)
+        current = child
+    return chain[-1]
+
+
+@contextmanager
+def refusals(store: "PostgresStore", session_id: Optional[str] = None) -> Iterator[None]:
+    """The store's failures (``translated``) and its typed refusals as the contract's classes, chaining the
+    original (the SQLite ``refusals`` port; the PG DDL has no foreign keys, so every session-row refusal is
+    the app-level check the verbs make, and the store's ``RuntimeError``-family refusals map here).
+    ``session_id`` names the session a session-level refusal reports."""
+    sid = session_id or ""
+    try:
+        with translated():
+            yield
+    except SessionCompressionInProgressError as exc:
+        raise CompressionInProgress(SessionId(sid), str(exc)) from exc
+    except CompressionSessionBusyError as exc:
+        raise CompressionBusy(SessionId(sid), str(exc)) from exc
+    except CompressionSessionClosedError as exc:
+        tip = _compression_tip(store, exc.session_id) if store is not None else exc.session_id
+        raise CompressionClosed(SessionId(exc.session_id), SessionId(tip)) from exc
+    except SessionTurnLeaseLostError as exc:
+        raise TurnLeaseLost(SessionId(sid), str(exc)) from exc
+    except SessionActiveWriteGuardError as exc:
+        raise SessionWriteGuarded(SessionId(sid), str(exc)) from exc
+    except HeldRowRewrittenError as exc:
+        raise HeldRowRewritten(SessionId(sid), str(exc)) from exc
+    except PruneRowStaleError as exc:
+        raise PruneRowStale(SessionId(sid), str(exc)) from exc
+    except PruneRowUnresolvedError as exc:
+        raise PruneRowUnresolved(SessionId(sid), str(exc)) from exc
+    except SessionResumeTooLargeError as exc:
+        raise ResumeTooLarge(exc.message_count, exc.limit, exc.scope) from exc
+    except SessionExportTooLargeError as exc:
+        raise ExportTooLarge(SessionId(exc.session_id), exc.message_count, exc.limit) from exc
+    except RewindTargetUnavailableError as exc:
+        raise RewindTargetUnavailable(str(exc)) from exc
 
 
 # ── connection pool (one per DSN, per process; plan 5.2 speed decision) ──────
@@ -502,6 +592,7 @@ class PostgresStore:
         self._conn: Optional[Connection] = None
         self._schema_ready = False
         self._generation: Optional[int] = None
+        self._snapshot_pins = threading.local()  # the read-snapshot connection each thread's open block pinned
         self.aio = AwaitableStore(self)
         for attribute in CAPABILITY_ATTRIBUTES:
             factory = _REPOSITORY_FACTORIES.get(attribute)
@@ -542,8 +633,13 @@ class PostgresStore:
     def _read_conn(self) -> Optional[Connection]:
         """The handle's read connection, or ``None`` when the store has never been written (no schema
         yet): an uninitialised store reads empty, as an absent SQLite file does, and is never created
-        by a read."""
+        by a read. This thread's open ``transcript_read_snapshot`` pins a second connection (its
+        REPEATABLE READ transaction), and every read inside that block takes it, so they see one
+        generation while the writes' connection commits around them."""
         self._refuse_read()
+        pinned = getattr(self._snapshot_pins, "conn", None)
+        if pinned is not None:
+            return pinned
         if self._conn is not None:
             return self._conn
         self._backend._require_open()
@@ -619,9 +715,53 @@ class PostgresStore:
                 conn.commit()
             except BaseException:
                 conn.rollback()
+                # A rollback undoes the checkout's ``SET search_path`` (plain SET is transaction-scoped: on
+                # rollback the session falls back to its previous default, which on a pooled connection is the
+                # previous store's pin or ``public``). Re-pin and settle it as the session default so the
+                # cached connection stays bound to this store's schema.
+                self._checkout(conn)
+                conn.commit()
                 raise
 
     # ── SQL ──
+
+    # libpq ``PQtransactionStatus``: 0 idle, 1 statement active, 2 in a transaction, 3 in error.
+    _SNAPSHOT_TX_INTRANS = 2
+
+    @contextmanager
+    def transcript_read_snapshot(self) -> Iterator[ReadCheck]:
+        """Every read this thread makes through this store inside the block sees ONE generation: a
+        SECOND pooled connection (the writes' connection is untouched) in a
+        ``BEGIN ISOLATION LEVEL REPEATABLE READ`` transaction, which ``_read_conn`` hands to
+        ``one``/``all``/``scalar`` for the block's duration, so a commit on the writes' connection
+        mid-block is hidden (the snapshot the first read establishes). No lock is held across the
+        block, and a write from inside it never waits on the block. ``consistent()`` is true while the
+        snapshot transaction is open and usable, so the caller reads again once it ends. Re-entrant:
+        a nested block checks the same pinned transaction."""
+        pinned = getattr(self._snapshot_pins, "conn", None)
+        if pinned is not None:
+            yield ReadCheck(lambda: pinned.info.transaction_status == self._SNAPSHOT_TX_INTRANS, pinned=True)
+            return
+        self._refuse_read()
+        self._backend._require_open()
+        dsn = _dsn()
+        with translated():
+            conn = _pool_for(dsn).getconn()
+            self._checkout(conn)
+            conn.commit()  # park the checkout's implicit transaction (the ``SET`` pin) before the snapshot
+            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            self._snapshot_pins.conn = conn
+            try:
+                yield ReadCheck(lambda: conn.info.transaction_status == self._SNAPSHOT_TX_INTRANS, pinned=True)
+            finally:
+                self._snapshot_pins.conn = None
+                try:
+                    if conn.info.transaction_status in (self._SNAPSHOT_TX_INTRANS, 3):  # in error too: end it
+                        conn.rollback()  # release the snapshot; the block was reads-only, nothing commits
+                except psycopg.Error:
+                    pass  # a dead connection is discarded below with the pool's replacement
+                with translated():
+                    _pool_for(dsn).putconn(conn)
 
     def one(self, sql: str, *params: Any) -> Optional[dict[str, Any]]:
         """One row of a read, as a dict; ``None`` when the read is empty or the store is uninitialised."""
@@ -655,6 +795,19 @@ class PostgresStore:
                     _pool_for(_dsn()).putconn(conn)
             except PersistenceError:
                 pass
+        pinned = getattr(self._snapshot_pins, "conn", None)
+        if pinned is not None:
+            try:
+                if pinned.info.transaction_status in (self._SNAPSHOT_TX_INTRANS, 3):
+                    pinned.rollback()
+            except psycopg.Error:
+                pass
+            try:
+                with translated():
+                    _pool_for(_dsn()).putconn(pinned)
+            except PersistenceError:
+                pass
+            self._snapshot_pins.conn = None
 
     def serves_same_store(self, other: object) -> bool:
         """Whether ``other`` reads and writes through this handle's store: the same schema, and the same

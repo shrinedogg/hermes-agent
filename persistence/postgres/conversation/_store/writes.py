@@ -214,8 +214,13 @@ def _replace_in_transaction(conn, session_id: str, messages: list[dict[str, Any]
         _check_transcript_write_guards(conn, session_id, None,
                                        reject_active_turn_lease=True,
                                        reject_active_compression_lock=True)
-    elif _ended(conn, session_id):
-        raise CompressionSessionClosedError(session_id)
+    else:
+        if _ended(conn, session_id):
+            raise CompressionSessionClosedError(session_id)
+        # The lease-fenced guard's last step, so a closed session still wins over a missing one.
+        if conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is None:
+            from persistence import SessionRowMissing, SessionId
+            raise SessionRowMissing(SessionId(session_id))
     kept = kept_tool_calls = 0
     if archive_dropped:
         # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose id
@@ -417,7 +422,7 @@ def set_user_message_content(store, session_id: str, row_id: int, content: Any,
             cur = conn.execute(
                 "UPDATE messages SET content = %s, api_content = NULL, display_metadata = %s "
                 "WHERE id = %s AND session_id = %s AND role = 'user' AND active = 1",
-                (_encode_content(content), _encode_display_metadata(merged_meta), row_id, session_id))
+                (_payload_bytes_param(_encode_content(content)), _encode_display_metadata(merged_meta), row_id, session_id))
             _reconcile_display_orders(conn, session_id)
             return cur.rowcount
     with store.tx() as conn:

@@ -375,6 +375,11 @@ def _check_transcript_write_guards(
     if _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()) \
             and not allow_closed_compression_parent:
         raise CompressionSessionClosedError(session_id)
+    # Last: the session row itself. In SQLite the insert's foreign key finds it; the DDL keeps the FK,
+    # but its violation maps to a generic store error, so the writer names the refusal itself - after the
+    # fences, so a lost lease or a compression-closed session still wins.
+    if conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is None:
+        raise SessionRowMissing(SessionId(session_id))
 
 
 def _lease_key(conn, session_id: str) -> str:

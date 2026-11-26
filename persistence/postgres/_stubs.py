@@ -22,8 +22,10 @@ def add_stubs(cls: type, protocol: type, implemented: tuple[str, ...] = ()) -> t
         if member.startswith("_") or member in implemented or hasattr(cls, member):
             continue
 
-        def _stub(self, _member: str = member, *args: Any, **kwargs: Any) -> Any:
-            raise NotImplementedError(f"postgres {type(self).__name__}.{_member} not ported (D8)")
+        # ``member`` is closed over per verb (never a default parameter, which a bound call's
+        # first real argument would shadow and misreport in the failure message).
+        def _stub(self, *args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError(f"postgres {type(self).__name__}.{member} not ported (D8)")
 
         _stub.__name__ = member
         setattr(cls, member, _stub)

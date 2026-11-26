@@ -1,167 +1,108 @@
-"""``MessageRepository`` on PostgreSQL: the slice verbs ported from the SQLite reference (``append``,
-``read_transcript``); every other messages verb raises ``NotImplementedError`` naming itself (D8).
+"""``MessageRepository`` on PostgreSQL: every contract verb ported from the SQLite reference (D8: no
+stubs remain - the DDL carries the schema, and the store layer under ``_store/`` carries the SQL).
 
-``append`` is the critical transcript write: the uid stamping (``message_uid`` minted once, the tool-call
-uids resolved against the batch), the turn-lease guard (an expired lease still naming the holder is
-renewed, otherwise ``TurnLeaseLost``), the closed-by-compression refusal (``CompressionClosed``), the
-missing-session-row refusal (``SessionRowMissing``), the row insert and the session counter bump, all
-in one transaction on the store's connection. ``read_transcript`` reads rows in insertion order
-(id, never timestamp) through the transcript row projection.
+Writes run on the handle's own pooled connection through the store writers (the guard, the row
+stamp and the counter bump in one ``store.tx()``); reads take ``one``/``all``/``scalar``, which a
+thread's open ``read_snapshot`` reroutes onto a second pooled connection's REPEATABLE READ
+transaction, so the snapshot's reads see one generation while a write commits around them. The PG
+DDL has no foreign keys, so the session-row refusal is the app-level check the write verbs make
+(``SessionRowMissing``), and the store's ``RuntimeError``-family refusals map to the contract's
+error family through ``refusals`` (plus the rewind's verbatim refusal texts to ``RewindRefused``).
 
-Porting notes (recorded for the stage-1 review): the display identity here is the plain dedupe key
-(role, content, timestamp, tool_call_id, tool_calls, tool_name, with the stable tool-call key for
-assistant rows) without the user-turn handoff-carrier normalization the SQLite store applies before
-keying - the display-generation parity suites (stage 1) decide whether that normalization must be
-ported too. The turn-lease conversation key walks compression parents in Python over the store's
-connection, the SQLite store's ``_session_turn_lease_key_on_conn`` shape.
+Porting notes (recorded for the stage-1 review): the payload columns (``content``/``api_content``/
+``reasoning_content``) are BYTEA (PostgreSQL ``text`` cannot hold the NUL the ``\\x00json:``
+sentinel encoding carries); every SQL comparison of a payload body goes through
+``convert_to(..., 'UTF8')`` and Python work through ``_payload_str``/``_payload_bytes``. Display
+identity is the plain dedupe key (role, content, timestamp, tool_call_id, tool_calls, tool_name,
+with the stable tool-call key for assistant rows). The detached-result appends (completion notes,
+delegation deliveries) and the latest-todo-result walk are ported here over the store's read and
+write doors.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 import time
-from typing import Any, Mapping, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
-from persistence import CompressionClosed, MessageId, RowVisibility, SessionRowMissing, SessionId, TurnLeaseLost
+from persistence import (
+    CooldownRestoreRefused, MessageId, RowVisibility, RewindRefused, SessionId,
+)
 from persistence.conversation.messages import (
-    MessageRepository, NewMessage, TranscriptRead, TranscriptRow, TranscriptView,
+    AnchoredView, AnchoredWindow, BatchAppendProgress, BatchAppendResult, CooldownSnapshot,
+    CompressionCooldown, CompactionResult, ConversationMessage, ConversationPeer, ConversationRequest,
+    ConversationRevision, DelegationDelivery, HeldMessage, MessageRecord, MessageStorageState,
+    MessageRepository, MessageId, NewMessage, PagedMessage, PruneRewriteResult, PrunedRowChange,
+    PrUrlHit, PromptPage, Reaction, ReplaceMode, ReplaceResult, ResumeConversations, RowDisposition,
+    RowOutcome, RowStamp, RowUids, SegmentPage, SessionTimeline, TimelineEntry, TranscriptRead,
+    TranscriptRow, TranscriptView, UnseenReaction, UserTurnRewind, Watermark,
 )
+from persistence.conversation.messages import RewindPlan as _RewindPlanRecord
 from persistence.sqlite.conversation._store.core import _CONTENT_JSON_PREFIX
-from persistence.sqlite.conversation._store.identity import (
-    _absorbed_uids_json, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json,
-)
-from persistence.sqlite.conversation._store.messages_sql import (
-    _coerce_timestamp, _parse_tool_calls, _tool_calls_count,
-)
 from persistence.sqlite.conversation._store.rules import (
-    DATA_USE, _sanitize_surrogates, coerce_epoch, stamp_message_uid,
+    ABSORBED_ROW_IDS, DB_ROW_SNAPSHOT, RESTORED_FROM_STORE,
 )
-from session_rules.turns import (
-    TOOL_CALL_UIDS, coalesce_tool_call_id, index_tool_call_uids, message_uid_or_none, mint_uid,
-    resolve_tool_call_uid,
-)
-from psycopg import errors as pg_errors
+from session_rules.turns import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 
-from .._backend import PostgresStore, register_repository, translated
+from .._backend import PostgresStore, refusals, register_repository
 from .._stubs import add_stubs
+from ._store import reads as _reads
+from ._store import timeline as _timeline
+from ._store import writes as _writes
+from ._store.common import _check_transcript_write_guards, _ensure_display_index, _in_placeholders
+from ._store.common import _row_to_message_dict as _store_row_to_message_dict
+from ._store.prune_rewrite import rewrite_pruned_rows as _store_rewrite_pruned_rows
+from ._store.prune_rewrite import rewritten_held_row_ids as _store_rewritten_held_row_ids
+from ._store.rewind import plan_user_turn_rewind as _store_plan_user_turn_rewind
+from ._store.rewind import retain_refused_turn_for_display as _store_retain_refused_turn
+from ._store.rewind import rewind_user_turn as _store_rewind_user_turn
+from ._store.stored_reads import display_generations as _store_display_generations
+from ._store.stored_reads import segment_page_messages as _store_segment_page_messages
+from ._store.stored_reads import transcript_cursor_state as _store_transcript_cursor_state
+from ._store.stored_reads import transcript_display_index_complete as _store_display_index_complete
+from ._store.stored_reads import transcript_handoff_rows as _store_transcript_handoff_rows
+from ._store.stored_reads import transcript_handoffs_shown_before as _store_transcript_handoffs_shown_before
+from ._store.stored_reads import transcript_tool_calls_before as _store_transcript_tool_calls_before
 
 __all__ = ["PgMessageRepository"]
 
-_INVALID = object()
-# The sessions row the transcript-write guard reads (the SQLite ``sql_common`` shape on the PG dialect).
-_ENDED_ROW_SQL = "SELECT ended_at, end_reason FROM sessions WHERE id = %s"
+# The legacy store's rewind refusal texts, by the contract reason each one is (the SQLite
+# ``_REWIND_REFUSALS``; the PG ``rewind`` store module raises the same verbatim texts).
+_REWIND_REFUSALS = {
+    "session history changed before the rewind could be persisted": "history_changed",
+    "active transcript changed before the rewind could be persisted": "history_changed",
+    "rewind target has no durable row identity": "target_unidentified",
+    "rewind target changed before it could be persisted": "target_changed",
+    "rewind did not retain its compaction handoff": "handoff_lost",
+}
 
 
-def _decode_display_metadata(raw: Any) -> Optional[dict[str, Any]]:
-    """Decode a ``display_metadata`` column to a dict (never raw TEXT: the desktop does ``'task_count'
-    in meta``); a double-encoded second string layer is unwrapped, and an invalid payload degrades to
-    the empty dict (the store's ``_decode_display_metadata``)."""
-    if raw is None:
-        return None
-    meta: Any = raw
-    for _ in range(2):
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except ValueError:
-                return None
-    return dict(meta) if isinstance(meta, dict) else None
-
-
-def _row_to_message_dict(row: dict[str, Any], *, summary_flag: bool = False) -> dict[str, Any]:
-    """``dict(row)`` with content/tool_calls/display_metadata decoded (the store's
-    ``_row_to_message_dict``: the display-index columns dropped, binary columns dropped,
-    ``_compressed_summary`` kept only as ``True``)."""
-    msg = dict(row)
-    msg.pop("display_identity", None)
-    msg.pop("display_order", None)
-    if summary_flag and msg.pop("_compressed_summary", 0):
-        msg["_compressed_summary"] = True
-    msg["content"] = _decode_content(msg["content"])
-    if msg.get("tool_calls"):
-        try:
-            msg["tool_calls"] = json.loads(msg["tool_calls"])
-        except (TypeError, ValueError):
-            msg["tool_calls"] = []
-    if msg.get("display_metadata") is not None:
-        msg["display_metadata"] = _decode_display_metadata(msg["display_metadata"])
-    for key, value in list(msg.items()):
-        if isinstance(value, (bytes, bytearray)) and key not in ("content", "display_identity"):
-            msg.pop(key)
-    return msg
-
-
-def _transcript_row(row: Mapping[str, Any]) -> TranscriptRow:
-    """A stored row dict (read back with the display columns decoded) as its record (the reference's
-    ``_transcript_row`` projection: the wire fields plus the visibility and summary flag)."""
-    from persistence.sqlite.conversation.messages import _WIRE_FIELDS
-
-    def _visibility(active: Any, compacted: Any) -> RowVisibility:
-        if active:
-            return RowVisibility.ACTIVE
-        return RowVisibility.COMPACTION_ARCHIVED if compacted else RowVisibility.REWOUND
-
-    fields = {name: row.get(name) for name in _WIRE_FIELDS}
-    return TranscriptRow(
-        id=MessageId(int(row["id"])), session_id=SessionId(row["session_id"]),
-        visibility=_visibility(row.get("active"), row.get("compacted")),
-        observed=bool(row.get("observed")),
-        compressed_summary=row.get("_compressed_summary") is True,
-        **fields,
-    )
-def _encode_content(content: Any) -> Any:
-    """Serialize list/dict content (multimodal parts) as a sentinel-prefixed JSON string; a literal
-    string carrying the reserved prefix is JSON-string-wrapped so it reads back verbatim."""
-    if isinstance(content, str):
-        content = _sanitize_surrogates(content)
-        if not content.startswith(_CONTENT_JSON_PREFIX):
-            return content
-    elif content is None or isinstance(content, (bytes, int, float)):
-        return content
+@contextmanager
+def _refusals(store: PostgresStore, session_id: Optional[SessionId] = None) -> Iterator[None]:
+    """``refusals`` (the store-level refusals to the contract's classes) plus the transcript writes'
+    own: the PG DDL has no foreign keys, so a missing session row is the app-level check the verbs
+    make, and a rewind's verbatim ``RuntimeError`` is ``RewindRefused`` with its reason."""
+    sid = str(session_id) if session_id is not None else None
     try:
-        return _CONTENT_JSON_PREFIX + json.dumps(content, ensure_ascii=True)
-    except (TypeError, ValueError):
-        return _sanitize_surrogates(str(content))
+        with refusals(store, session_id):
+            yield
+    except RuntimeError as exc:
+        reason = _REWIND_REFUSALS.get(str(exc))
+        if reason is None or sid is None:
+            raise
+        raise RewindRefused(SessionId(sid), reason, str(exc)) from exc
 
 
-def _decode_content(content: Any) -> Any:
-    """Reverse ``_encode_content``: a reserved-prefix string that isn't valid JSON reads back raw."""
-    if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
-        return _json_value_or(content[len(_CONTENT_JSON_PREFIX):], content, "raw JSON content")
-    return content
-
-
-def _json_value_or(raw: Any, fallback: Any, warning: str) -> Any:
-    """A stored JSON column decoded to *fallback* when absent or unreadable (the store's ``_json_or``)."""
-    if raw in (None, ""):
-        return fallback
-    if isinstance(raw, (list, dict)):
-        return raw
-    try:
-        return json.loads(raw)
-    except (TypeError, ValueError):
-        return fallback
-
-
-def _payload_bytes(value: Any) -> Optional[bytes]:
-    """A payload column (``content``/``api_content``/``reasoning_content``) as its BYTEA storage form:
-    UTF-8 bytes (PostgreSQL ``text`` cannot hold the NUL the ``\\x00json:`` sentinel encoding carries;
-    the SQLite reference stores it in a BLOB/TEXT column that can). Non-string scalars are coerced
-    through ``str`` first (the SQLite TEXT affinity)."""
-    if value is None:
-        return None
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    if isinstance(value, str):
-        return value.encode("utf-8")
-    return str(value).encode("utf-8")
+def _visibility(active: Any, compacted: Any) -> RowVisibility:
+    if active:
+        return RowVisibility.ACTIVE
+    return RowVisibility.COMPACTION_ARCHIVED if compacted else RowVisibility.REWOUND
 
 
 def _payload_str(value: Any) -> Optional[str]:
-    """The inverse of :func:`_payload_bytes` for a read-back row: the payload column's stored UTF-8
-    bytes decoded (None stays None)."""
+    """The payload column (``content``/``api_content``/``reasoning_content``) read back from its BYTEA
+    storage form: the stored UTF-8 bytes decoded (None stays None; strings pass through)."""
     if value is None:
         return None
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -169,275 +110,901 @@ def _payload_str(value: Any) -> Optional[str]:
     return value
 
 
-def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
-    """Serialize ``display_metadata`` for its TEXT column; an already-serialized JSON string is not
-    double-encoded; a non-object value is refused."""
-    if not display_metadata:
-        return None
-    if isinstance(display_metadata, str):
-        display_metadata = _json_value_or(display_metadata, _INVALID, "non-JSON display metadata")
-        if display_metadata is _INVALID or not isinstance(display_metadata, dict):
-            return None
-    elif not isinstance(display_metadata, dict):
-        return None
-    return json.dumps(display_metadata)
+def _sidecar(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
 
 
-def _reasoning_json_text(value: Any) -> Optional[str]:
-    """A structured reasoning field for its TEXT column: strings store as-is (re-dumping would
-    double-encode), structured values dump as JSON."""
-    return None if not value else (value if isinstance(value, str) else json.dumps(value))
+# ``NewMessage`` fields that travel under their own name when set (the SQLite reference's set, all of
+# it: the PG store's writers stamp every one).
+_MESSAGE_OPTIONALS = (
+    "tool_name", "tool_call_id", "display_kind", "api_content", "platform_message_id", "effect_disposition",
+    "finish_reason", "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items",
+    "codex_message_items", "token_count", "message_uid",
+)
 
 
-def _scrub(value: Any) -> Any:
-    return _sanitize_surrogates(value) if isinstance(value, str) else None
+def _message_dict(message: NewMessage) -> dict[str, Any]:
+    """One ``NewMessage`` as the message dict the store's writers take (the SQLite ``_message_dict``)."""
+    msg: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.timestamp is not None:
+        msg["timestamp"] = message.timestamp
+    if message.tool_calls:
+        msg["tool_calls"] = list(message.tool_calls)
+    for name in _MESSAGE_OPTIONALS:
+        value = getattr(message, name)
+        if value is not None:
+            msg[name] = value
+    if message.display_metadata is not None:
+        msg["display_metadata"] = dict(message.display_metadata)
+    if message.compressed_summary:
+        msg["_compressed_summary"] = True
+    if message.observed:
+        msg["observed"] = True
+    if message.repair_target is not None:
+        msg["_row_id"] = int(message.repair_target)
+    if message.db_row_snapshot is not None:
+        msg[DB_ROW_SNAPSHOT] = message.db_row_snapshot
+    if message.absorbed_message_uids:
+        msg["_absorbed_message_uids"] = list(message.absorbed_message_uids)
+    if message.tool_call_uids is not None:
+        msg["_tool_call_uids"] = dict(message.tool_call_uids)
+    if message.tool_call_uid is not None:
+        msg["_tool_call_uid"] = message.tool_call_uid
+    if message.data_use:
+        msg["data_use"] = list(message.data_use)
+    if message.merged_durable_rows:
+        msg[MERGED_DURABLE_ROWS] = message.merged_durable_rows
+    if message.unnamed_durable_rows:
+        msg[UNNAMED_DURABLE_ROWS] = message.unnamed_durable_rows
+    if message.absorbed_row_ids:
+        msg[ABSORBED_ROW_IDS] = [int(i) for i in message.absorbed_row_ids]
+    if message.restored_from_store:
+        msg[RESTORED_FROM_STORE] = True
+    return msg
 
 
-def _display_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    """The display identity key (stable tool key for complete assistant call sets, else the content
-    key)."""
-    return _stable_tool_key(row) or (
-        row["role"], row["content"], row["timestamp"], row["tool_call_id"], row["tool_calls"], row["tool_name"]
+def _held_dict(held: HeldMessage) -> dict[str, Any]:
+    """One ``HeldMessage`` as the held message dict the store compares (the SQLite ``_held_dict``)."""
+    msg: dict[str, Any] = {"role": held.role, "content": held.content}
+    if held.tool_call_id is not None:
+        msg["tool_call_id"] = held.tool_call_id
+    if held.tool_calls:
+        msg["tool_calls"] = list(held.tool_calls)
+    if held.timestamp is not None:
+        msg["timestamp"] = held.timestamp
+    if held.row_id is not None:
+        msg["_row_id"] = int(held.row_id)
+    if held.persisted:
+        msg["_db_persisted"] = True
+    if held.db_row_snapshot is not None:
+        msg[DB_ROW_SNAPSHOT] = held.db_row_snapshot
+    if held.message_uid is not None:
+        msg["message_uid"] = held.message_uid
+    if held.absorbed_row_ids:
+        msg[ABSORBED_ROW_IDS] = [int(i) for i in held.absorbed_row_ids]
+    if held.merged_durable_rows:
+        msg[MERGED_DURABLE_ROWS] = held.merged_durable_rows
+    if held.retired_durable_rows:
+        msg[RETIRED_DURABLE_ROWS] = [_held_dict(row) for row in held.retired_durable_rows]
+    if held.tool_call_ids:
+        msg["tool_call_ids"] = list(held.tool_call_ids)
+    if held.own_row:
+        msg["own_row"] = True
+    if held.retired_row:
+        msg["retired_row"] = True
+    return msg
+
+
+def _pruned_original(change: PrunedRowChange) -> dict[str, Any]:
+    """The message dict the in-place rewrite names, compares and diffs: ``before`` as written, with the
+    held original's fields over it, so the row id and ownership version come from the original alone."""
+    before = {key: value for key, value in _message_dict(change.before).items()
+              if key not in ("_row_id", DB_ROW_SNAPSHOT)}
+    return {**before, **_held_dict(change.original)}
+
+
+def _transcript_row(row: Mapping[str, Any]) -> TranscriptRow:
+    """A stored row dict (read back with the payload columns decoded) as its record (the reference's
+    ``_transcript_row`` projection: the wire fields plus the visibility and summary flag)."""
+    from persistence.sqlite.conversation.messages import _WIRE_FIELDS
+
+    fields = {name: row.get(name) for name in _WIRE_FIELDS}
+    return TranscriptRow(
+        id=MessageId(int(row["id"])), session_id=SessionId(str(row["session_id"])),
+        visibility=_visibility(row.get("active"), row.get("compacted")),
+        observed=bool(row.get("observed")),
+        compressed_summary=row.get("_compressed_summary") is True,
+        **fields,
     )
 
 
-def _display_identity(key: tuple[Any, ...]) -> bytes:
-    """The fixed-width durable identity for indexed display-generation lookup (the SQLite store's
-    sha256 of the key's repr)."""
-    return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
+def _message_record(row: Mapping[str, Any]) -> MessageRecord:
+    """A stored row dict as its typed record (reactions are not part of the record's metadata)."""
+    from persistence.conversation.messages import MessageRecord as _Record
+
+    from persistence.sqlite.conversation.messages import _SIDECARS
+
+    metadata = row.get("display_metadata")
+    if isinstance(metadata, dict):
+        metadata = {key: value for key, value in metadata.items() if key != "reactions"} or None
+    return _Record(
+        id=MessageId(int(row["id"])), role=row["role"], content=row.get("content"),
+        timestamp=float(row["timestamp"]), tool_calls=tuple(row.get("tool_calls") or ()),
+        tool_name=row.get("tool_name"), tool_call_id=row.get("tool_call_id"),
+        display_kind=row.get("display_kind"), compressed_summary=bool(row.get("_compressed_summary")),
+        visibility=_visibility(row.get("active"), row.get("compacted")), api_content=row.get("api_content"),
+        display_metadata=metadata, platform_message_id=row.get("platform_message_id"),
+        observed=bool(row.get("observed")), effect_disposition=row.get("effect_disposition"),
+        finish_reason=row.get("finish_reason"), reasoning=row.get("reasoning"),
+        reasoning_content=row.get("reasoning_content"),
+        **{name: _sidecar(row.get(name)) for name in _SIDECARS}, message_uid=row.get("message_uid"))
 
 
-def _is_explicit_fork_child_row(session: dict[str, Any], *, include_reset: bool = False) -> bool:
-    """True when the session row is a branch, delegate, or tool child of its parent (``include_reset``:
-    also a reset fork); markers only count when they point at ``parent_session_id`` (the PG twin of the
-    SQLite store's check, parsed in Python over the stored JSON)."""
-    if session.get("source") == "tool":
-        return True
-    cfg = session.get("model_config")
-    if isinstance(cfg, str):
-        try:
-            cfg = json.loads(cfg)
-        except (json.JSONDecodeError, TypeError):
-            return False
-    if not isinstance(cfg, dict):
-        return False
-    markers = (cfg.get("_branched_from"), cfg.get("_delegate_from"))
-    if include_reset:
-        markers += (cfg.get("_reset_from"),)
-    parent_id = session.get("parent_session_id")
-    return parent_id in markers if parent_id else any(m is not None for m in markers)
+def _stamp(msg: Mapping[str, Any], stored: Mapping[int, Mapping[str, Any]]) -> RowStamp:
+    """The row state a write left on one message dict; a kept row the write did not restamp takes its
+    stored timestamp (the SQLite ``_stamp``)."""
+    row_id = int(msg["_row_id"])
+    timestamp = msg.get("timestamp")
+    if timestamp is None:
+        timestamp = stored[row_id]["timestamp"]
+    return RowStamp(
+        id=MessageId(row_id), timestamp=float(timestamp),
+        db_row_snapshot=msg.get(DB_ROW_SNAPSHOT),
+        message_uid=msg.get("message_uid") or stored.get(row_id, {}).get("message_uid") or "",
+        tool_call_uids=msg.get("_tool_call_uids"), tool_call_uid=msg.get("_tool_call_uid"))
 
 
-def _session_turn_lease_key(store: PostgresStore, conn, session_id: str) -> str:
-    """Walk compression parents on the store's connection to the conversation lease key (the SQLite
-    ``_session_turn_lease_key_on_conn`` shape: the same connection, markers bind to ``parent_session_id``)."""
-    if not session_id:
-        return session_id
-
-    def _row(sid: str) -> Optional[dict[str, Any]]:
-        row = conn.execute(
-            "SELECT id, parent_session_id, source, model_config, end_reason FROM sessions WHERE id = %s", (sid,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    current = _row(session_id)
-    seen = {session_id}
-    while current:
-        parent_id = current.get("parent_session_id")
-        if not parent_id or parent_id in seen or _is_explicit_fork_child_row(current, include_reset=True):
-            break
-        parent = _row(parent_id)
-        if not parent or parent.get("end_reason") != "compression":
-            break
-        seen.add(parent_id)
-        current = parent
-    return str(current.get("id") or session_id) if current else session_id
+def _row_outcomes(rows: Sequence[Mapping[str, Any]], count: int) -> tuple[RowOutcome, ...]:
+    """The batch's outcomes from the row state the write stamped on each dict and its fresh-row
+    ``count``: fresh ids are minted inside the write, so they are the ``count`` largest; any other row
+    resolved to an existing target: ADOPTED when it took a canonical row other than lent metadata,
+    REPAIRED otherwise (the SQLite ``_row_outcomes``)."""
+    fresh = set(sorted({int(row["_row_id"]) for row in rows}, reverse=True)[:count])
+    outcomes = []
+    for row in rows:
+        row_id, canonical = int(row["_row_id"]), row.get("_canonical_row")
+        if row_id in fresh:
+            disposition = RowDisposition.APPENDED
+        elif canonical is not None and not canonical.get("_metadata_only"):
+            disposition = RowDisposition.ADOPTED
+        else:
+            disposition = RowDisposition.REPAIRED
+        outcomes.append(RowOutcome(
+            id=MessageId(row_id), disposition=disposition, timestamp=float(row["timestamp"]),
+            db_row_snapshot=row.get(DB_ROW_SNAPSHOT), canonical_row=canonical,
+            message_uid=row.get("message_uid"), tool_call_uids=row.get("_tool_call_uids"),
+            tool_call_uid=row.get("_tool_call_uid")))
+    return tuple(outcomes)
 
 
 class PgMessageRepository:
-    """``MessageRepository`` verbs on the bound profile's store schema; unported verbs raise (D8)."""
+    """``MessageRepository`` on the bound profile's store schema (every verb ported; the store layer
+    under ``_store/`` carries the SQL, the verbs here carry the contract mapping)."""
 
     def __init__(self, store: PostgresStore) -> None:
         self._store = store
 
-    # ── the slice verbs ──
+    # ── writes ──
 
     def append(self, session_id: SessionId, message: NewMessage, *,
                turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> MessageId:
         """Append one row and bump the session counters in one transaction; returns its id (the protocol
         docstring's refusals: ``TurnLeaseLost``, ``CompressionClosed``, ``SessionRowMissing``)."""
         store = self._store
-        msg = self._message_dict(message)
-        with store.tx() as conn:
-            session_row = conn.execute(
-                "SELECT id FROM sessions WHERE id = %s", (session_id,)
-            ).fetchone()
-            if session_row is None:
-                raise SessionRowMissing(SessionId(session_id))
-            self._check_transcript_write_guards(conn, session_id,
-                                                turn_lease_holder=turn_lease_holder,
-                                                turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            # Encode outside the statement (display metadata first, log-order parity).
-            msg["display_metadata"] = _encode_display_metadata(msg.get("display_metadata"))
-            tool_calls = _parse_tool_calls(msg.get("tool_calls"))
-            message_timestamp = _coerce_timestamp(message.timestamp, time.time())
-            stamp_message_uid(msg)
-            self._stamp_tool_call_uids(msg, tool_calls, {})
-            params = self._message_row_params(session_id, message.role, msg, tool_calls, message_timestamp)
-            row = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                        tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
-                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                        codex_message_items, platform_message_id, observed, _compressed_summary, active,
-                        api_content, display_kind, display_metadata, display_identity, message_uid,
-                        absorbed_message_uids, tool_call_uids, tool_call_uid)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1,
-                           %s, %s, %s, %s, %s, %s, %s, %s)
-                   RETURNING id""",
-                params,
-            ).fetchone()
-            self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls))
-        return MessageId(int(row["id"]))
+        msg = _message_dict(message)
+        self._append_one(store, session_id, msg, turn_lease_holder=turn_lease_holder,
+                         turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return MessageId(int(msg["_row_id"]))
+
+    def append_batch(self, session_id: SessionId, messages: Sequence[NewMessage], *,
+                     turn_lease_holder: Optional[str] = None,
+                     chunk_rows: Optional[int] = None, turn_lease_ttl_seconds: float = 300.0) -> BatchAppendResult:
+        """Append a batch of rows, one write transaction per chunk; the outcomes name each row's stamp and
+        disposition (the SQLite ``append_batch``)."""
+        store = self._store
+        dicts = [_message_dict(m) for m in messages]
+        chunks = [dicts]
+        if chunk_rows is not None and len(dicts) > chunk_rows:
+            # Each chunk indexes only its own rows: pair results across chunk boundaries.
+            chunks = [dicts[start:start + chunk_rows] for start in range(0, len(dicts), chunk_rows)]
+        committed: list[RowOutcome] = []
+        try:
+            with _refusals(store, session_id):
+                for chunk in chunks:  # one write transaction each
+                    inserted = _writes.append_batch(store, str(session_id), chunk,
+                                                    turn_lease_holder=turn_lease_holder,
+                                                    turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+                    committed.extend(_row_outcomes(chunk, inserted))
+        except BaseException as exc:
+            exc.batch_progress = BatchAppendProgress(outcomes=tuple(committed), uids=tuple(
+                RowUids(message_uid=msg.get("message_uid") or None, tool_call_uids=msg.get("_tool_call_uids"),
+                        tool_call_uid=msg.get("_tool_call_uid")) for msg in dicts))
+            raise
+        return BatchAppendResult(outcomes=tuple(committed))
+
+    def append_delegation_delivery(self, session_id: SessionId, delivery: DelegationDelivery) -> MessageId:
+        """Record a detached delegation result once, keyed by its ``delegation_id`` (the SQLite
+        ``append_delegation_delivery``; a live turn or a closed-by-compression session refuses)."""
+        store = self._store
+        metadata = dict(delivery.metadata)
+        delegation_id = metadata.get("delegation_id")
+        if not delegation_id:
+            raise ValueError("Delegation delivery requires a stable delegation_id")
+        kind = "hidden" if metadata.get("presentation_suppressed") else "async_delegation_complete"
+        match_sql = (
+            "m.display_kind IN ('async_delegation_complete', 'hidden') "
+            "AND COALESCE(((CASE WHEN m.display_metadata IS NULL OR m.display_metadata = '' "
+            "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'delegation_id'), '') = %s "
+            "AND COALESCE(((CASE WHEN m.display_metadata IS NULL OR m.display_metadata = '' "
+            "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'delivery_notice'), '') = %s")
+        return MessageId(self._append_detached_result(
+            store, session_id, delivery.content, kind, metadata, match_sql,
+            (str(delegation_id), str(metadata.get("delivery_notice", "")))))
+
+    def append_completion_note(self, session_id: SessionId, admission_id: str, content: str,
+                              display_kind: str, metadata: Mapping[str, Any]) -> MessageId:
+        """Record an unviewed completion's note once, keyed by its admission (stored as
+        ``completion_admission``; the SQLite ``append_completion_note``)."""
+        store = self._store
+        match_sql = (
+            "COALESCE(((CASE WHEN m.display_metadata IS NULL OR m.display_metadata = '' "
+            "THEN '{}'::jsonb ELSE m.display_metadata::jsonb END) ->> 'completion_admission'), '') = %s")
+        return MessageId(self._append_detached_result(
+            store, session_id, content, display_kind, {**dict(metadata), "completion_admission": admission_id},
+            match_sql, (str(admission_id),)))
+
+    def replace_transcript(self, session_id: SessionId, messages: Sequence[NewMessage], mode: ReplaceMode, *,
+                           reject_active_turn_lease: bool = False) -> ReplaceResult:
+        """Atomically replace the session's transcript (the SQLite ``replace_transcript``: the in-order
+        prefix keeps its rows; the divergent suffix is archived or deleted; a kept row that the write
+        did not restamp takes its stored timestamp for its stamp)."""
+        store = self._store
+        dicts = [_message_dict(m) for m in messages]
+        for msg in dicts:  # a replace stamps no ownership version on a row it keeps
+            msg.pop(DB_ROW_SNAPSHOT, None)
+        with _refusals(store, session_id):
+            _writes.replace_transcript(store, str(session_id), dicts,
+                                       active_only=mode is ReplaceMode.PRESERVE_EXISTING_ARCHIVE,
+                                       archive_dropped=mode is ReplaceMode.ARCHIVE_DROPPED,
+                                       reject_active_turn_lease=reject_active_turn_lease)
+            kept = any(m.get("timestamp") is None or not m.get("message_uid") for m in dicts)
+            stored = {int(r["id"]): r for r in _reads.get_messages(store, str(session_id))} if kept else {}
+        return ReplaceResult(rows=tuple(_stamp(m, stored) for m in dicts))
+
+    def clear_transcript(self, session_id: SessionId) -> None:
+        store = self._store
+        with _refusals(store, session_id):
+            _writes.clear_transcript(store, str(session_id))
+
+    def rewind_user_turn(self, session_id: SessionId, user_ordinal: int, *,
+                         warm_history: Optional[Sequence[Mapping[str, Any]]] = None, require_retryable: bool = False,
+                         require_composite: bool = False, adopt_row_ids: bool = False) -> UserTurnRewind:
+        store = self._store
+        with _refusals(store, session_id):
+            outcome = _store_rewind_user_turn(
+                store, str(session_id), user_ordinal,
+                warm_history=None if warm_history is None else [dict(m) for m in warm_history],
+                require_retryable=require_retryable, require_composite=require_composite,
+                adopt_row_ids=adopt_row_ids)
+        return UserTurnRewind(prefix=tuple(outcome.prefix), live_view=outcome.live_view,
+                              live_text=outcome.live_text, rewound_count=outcome.rewound_count,
+                              turns_undone=outcome.turns_undone)
+
+    def retain_refused_turn_for_display(self, session_id: SessionId, *, notice: str,
+                                        boundary_row_id: Optional[MessageId] = None) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return _store_retain_refused_turn(
+                store, str(session_id), notice=notice,
+                boundary_row_id=None if boundary_row_id is None else int(boundary_row_id))
+
+    def compact(self, session_id: SessionId, replacement: Sequence[NewMessage], *,
+                watermark: Optional[Watermark] = None, carried_tail_count: int = 0,
+                lock_holder: Optional[str] = None, model_config_patch: Optional[Mapping[str, Any]] = None,
+                carried: Sequence[HeldMessage] = (), coverage: Optional[Any] = None,
+                held_for_cas: Optional[Sequence[HeldMessage]] = None) -> CompactionResult:
+        store = self._store
+        dicts = [_message_dict(m) for m in replacement]
+        with _refusals(store, session_id):
+            active = _writes.archive_and_compact(
+                store, str(session_id), dicts,
+                model_config_patch=None if model_config_patch is None else dict(model_config_patch),
+                watermark=None if watermark is None else int(watermark.last_active or 0),
+                lock_holder=lock_holder, tail_count=carried_tail_count,
+                carried_messages=[_held_dict(m) for m in carried] or None,
+                covered_ids=None if coverage is None else [int(i) for i in coverage.covered_ids],
+                unresolved_held=None if coverage is None else [_held_dict(m) for m in coverage.unresolved],
+                held_for_cas=None if held_for_cas is None else [_held_dict(m) for m in held_for_cas])
+        return CompactionResult(active_count=active, rows=tuple(_stamp(m, {}) for m in dicts))
+
+    def rewrite_pruned_rows(self, session_id: SessionId, changes: Sequence[PrunedRowChange], *,
+                            model_config_patch: Optional[Mapping[str, Any]] = None,
+                            turn_lease_holder: Optional[str] = None,
+                            turn_lease_ttl_seconds: float = 300.0) -> PruneRewriteResult:
+        store = self._store
+        pairs = [(_pruned_original(c), _message_dict(c.replacement)) for c in changes]
+        for _, replacement in pairs:
+            replacement.pop(DB_ROW_SNAPSHOT, None)
+        with _refusals(store, session_id):
+            rewritten = _store_rewrite_pruned_rows(
+                store, str(session_id), pairs,
+                model_config_patch=None if model_config_patch is None else dict(model_config_patch),
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return PruneRewriteResult(rewritten=rewritten,
+                                  snapshots=tuple(replacement.get(DB_ROW_SNAPSHOT) for _, replacement in pairs))
+
+    def purge_stale_tool_call_markers(self, *, dry_run: bool = False, backup: bool = True) -> "MarkerPurgeReport":
+        store = self._store
+        with _refusals(store):
+            report = _writes.purge_stale_tool_call_markers(store, dry_run=dry_run, backup=backup)
+        from persistence.conversation.messages import MarkerPurgeReport
+        return MarkerPurgeReport(dry_run=report["dry_run"], rows_affected=report["rows_affected"],
+                                 row_ids=tuple(MessageId(i) for i in report["row_ids"]),
+                                 backup_path=report["backup_path"])
+
+    def set_user_message_content(self, session_id: SessionId, message_id: MessageId, content: Any,
+                                display_metadata: Optional[Mapping[str, Any]] = None) -> bool:
+        store = self._store
+        metadata = dict(display_metadata) if display_metadata is not None else None
+        with _refusals(store, session_id):
+            return bool(_writes.set_user_message_content(store, str(session_id), int(message_id),
+                                                         content, metadata))
+
+    def deactivate_message(self, session_id: SessionId, message_id: MessageId) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return int(_writes.deactivate_message(store, str(session_id), int(message_id))) > 0
+
+    def deactivate_messages_by_display_kind(self, session_id: SessionId, display_kind: str) -> int:
+        store = self._store
+        with _refusals(store, session_id):
+            return int(_writes.deactivate_messages_by_display_kind(store, str(session_id), display_kind))
+
+    def set_latest_matching_message_display_kind(self, session_id: SessionId, *, role: str, content: str,
+                                                 display_kind: str,
+                                                 display_metadata: Optional[Mapping[str, Any]] = None) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return bool(_writes.set_latest_matching_message_display_kind(
+                store, str(session_id), role=role, content=content, display_kind=display_kind,
+                display_metadata=None if display_metadata is None else dict(display_metadata)))
+
+    def set_latest_user_api_content(self, session_id: SessionId, content: Any, api_content: str) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return bool(_writes.set_latest_user_api_content(store, str(session_id), content, api_content))
+
+    def set_message_api_content(self, session_id: SessionId, message_id: MessageId, content: Any,
+                               api_content: str) -> bool:
+        store = self._store
+        row_id = int(message_id)
+        if row_id <= 0:
+            return False
+        with _refusals(store, session_id):
+            return bool(_writes.set_message_api_content(store, str(session_id), row_id, content, api_content))
+
+    def record_compression_cooldown(self, session_id: SessionId, until: float, error: Optional[str] = None) -> None:
+        store = self._store
+        with _refusals(store, session_id):
+            _writes.record_compression_failure_cooldown(store, str(session_id), until, error)
+
+    def clear_compression_cooldown(self, session_id: SessionId) -> None:
+        store = self._store
+        with _refusals(store, session_id):
+            _writes.clear_compression_failure_cooldown(store, str(session_id))
+
+    def restore_compression_cooldown(self, session_id: SessionId, snapshot: CooldownSnapshot) -> None:
+        store = self._store
+        row = {"session_exists": snapshot.present, "cooldown_until": snapshot.until, "error": snapshot.error}
+        try:
+            with _refusals(store, session_id):
+                _writes.restore_compression_failure_cooldown_row(store, str(session_id), row)
+        except RuntimeError as exc:
+            if isinstance(exc, (CooldownRestoreRefused,)):
+                raise
+            raise CooldownRestoreRefused(SessionId(str(session_id)), str(exc)) from exc
+
+    def set_reaction(self, session_id: SessionId, message_id: MessageId, emoji: Optional[str], *,
+                    author: str) -> Optional[tuple[Reaction, ...]]:
+        store = self._store
+        with _refusals(store, session_id):
+            reactions = _writes.set_message_reaction(store, str(session_id), int(message_id), emoji, author=author)
+        if reactions is None:
+            return None
+        return tuple(Reaction(emoji=r.get("emoji"), author=r.get("author"), at=float(r.get("at") or 0.0),
+                              seen=bool(r.get("seen")))
+                     for r in reactions)
+
+    def take_unseen_reactions(self, session_id: SessionId, *, author: str = "user") -> tuple[UnseenReaction, ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            pending = _writes.take_unseen_reactions(store, str(session_id), author=author)
+        return tuple(UnseenReaction(row_id=MessageId(p["row_id"]), role=p["role"], emoji=p["emoji"], text=p["text"])
+                     for p in pending)
+
+    # ── reads ──
 
     def read_transcript(self, session_id: SessionId, request: TranscriptRead = TranscriptRead()) -> tuple[TranscriptRow, ...]:
-        """The session's transcript rows as records, in insertion order (id, never timestamp). The slice read is
-        the ACTIVE view; ``request``'s paging and the other views come with the stage-1 port."""
+        """The session's transcript rows as records, in insertion order (id, never timestamp); ``request``
+        selects the view, paging and the lineage (the SQLite ``read_transcript`` over ``get_messages``)."""
         store = self._store
-        rows = store.all("SELECT * FROM messages WHERE session_id = %s AND active = 1 ORDER BY id ASC", session_id)
-        for row in rows:
-            for column in ("content", "api_content", "reasoning_content"):
-                row[column] = _payload_str(row.get(column))
-        return tuple(_transcript_row(_row_to_message_dict(row, summary_flag=True)) for row in rows)
+        with _refusals(store, session_id):
+            rows = _reads.get_messages(
+                store, str(session_id),
+                include_inactive=request.view is TranscriptView.ALL,
+                include_compacted=request.view is TranscriptView.DISPLAY,
+                limit=request.limit, offset=request.offset, latest=request.latest,
+                after_id=None if request.after_id is None else int(request.after_id),
+                include_ancestors=request.include_lineage)
+        return tuple(_transcript_row(row) for row in rows)
 
-    # ── append's helpers (the SQLite store functions, ported) ──
+    def active_message_ids(self, session_id: SessionId) -> tuple[MessageId, ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            return tuple(MessageId(i) for i in _reads.get_active_message_ids(store, str(session_id)))
 
-    def _message_dict(self, message: NewMessage) -> dict[str, Any]:
-        """One ``NewMessage`` as the message dict the writers take (the SQLite ``_message_dict``)."""
-        from persistence.sqlite.conversation.messages import _MESSAGE_OPTIONALS
+    def active_watermark(self, session_id: SessionId) -> Watermark:
+        store = self._store
+        with _refusals(store, session_id):
+            last = _reads.get_active_message_watermark(store, str(session_id))
+        return Watermark(MessageId(last) if last else None)
 
-        msg: dict[str, Any] = {"role": message.role, "content": message.content}
-        if message.timestamp is not None:
-            msg["timestamp"] = message.timestamp
-        if message.tool_calls:
-            msg["tool_calls"] = list(message.tool_calls)
-        for name in _MESSAGE_OPTIONALS:
-            value = getattr(message, name)
-            if value is not None:
-                msg[name] = value
-        if message.display_metadata is not None:
-            msg["display_metadata"] = dict(message.display_metadata)
-        if message.compressed_summary:
-            msg["_compressed_summary"] = True
-        if message.observed:
-            msg["observed"] = True
-        if message.repair_target is not None:
-            msg["_row_id"] = int(message.repair_target)
-        if message.db_row_snapshot is not None:
-            msg["db_row_snapshot"] = message.db_row_snapshot
-        if message.absorbed_message_uids:
-            msg["_absorbed_message_uids"] = list(message.absorbed_message_uids)
-        if message.tool_call_uids is not None:
-            msg[TOOL_CALL_UIDS] = dict(message.tool_call_uids)
-        return msg
+    def count_all(self) -> int:
+        store = self._store
+        with _refusals(store):
+            return _reads.message_count(store)
 
-    def _check_transcript_write_guards(self, conn, session_id: str, *,
-                                      turn_lease_holder: Optional[str] = None,
-                                      turn_lease_ttl_seconds: float = 300.0) -> None:
-        """The transcript-write admission checks, run inside the write transaction: a named turn lease
-        that no longer names the holder (or an active lease on an unfenced write) is a refusal, an
-        expired lease still naming the holder is renewed; a session ended by compression refuses."""
-        if turn_lease_holder:
-            conversation_id = _session_turn_lease_key(self._store, conn, session_id)
-            lease = conn.execute(
-                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = %s",
-                (conversation_id,),
-            ).fetchone()
-            now = time.time()
-            if lease is None or lease["holder"] != turn_lease_holder:
-                raise TurnLeaseLost(f"Session turn lease lost; refusing transcript write for {session_id!r}")
-            if float(lease["expires_at"]) <= now:
-                conn.execute(
-                    "UPDATE session_turn_leases SET expires_at = %s WHERE conversation_id = %s AND holder = %s",
-                    (now + max(0.1, float(turn_lease_ttl_seconds)), conversation_id, turn_lease_holder),
-                )
-        ended = conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()
-        if _ended_by_compression(ended):
-            raise CompressionClosed(str(session_id))
+    def display_count(self, session_id: SessionId) -> int:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.display_message_count(store, str(session_id))
 
-    def _message_row_params(self, session_id: str, role: str, msg: dict[str, Any], tool_calls: Any,
-                           message_timestamp: float) -> tuple:
-        """The insert's bound values (the SQLite ``_message_row_params`` column order)."""
-        encoded_content = _encode_content(msg.get("content"))
-        encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
-        display_metadata = msg.get("display_metadata")
-        if msg.get(DATA_USE) and isinstance(display_metadata, (dict, type(None))):
-            display_metadata = {**(display_metadata or {}), DATA_USE: list(msg[DATA_USE])}
-        display_metadata = _encode_display_metadata(display_metadata)
-        identity_row = {
-            "role": role, "content": encoded_content, "timestamp": message_timestamp,
-            "tool_call_id": msg.get("tool_call_id"), "tool_calls": encoded_tool_calls,
-            "tool_name": _scrub(msg.get("tool_name")), "display_kind": msg.get("display_kind"),
-            "display_metadata": display_metadata,
-        }
-        return (
-            session_id, role, _payload_bytes(encoded_content), msg.get("tool_call_id"),
-            encoded_tool_calls, _scrub(msg.get("tool_name")),
-            msg.get("effect_disposition"), message_timestamp, msg.get("token_count"), msg.get("finish_reason"),
-            _scrub(msg.get("reasoning")), _payload_bytes(_scrub(msg.get("reasoning_content"))),
-            _reasoning_json_text(msg.get("reasoning_details")),
-            _reasoning_json_text(msg.get("codex_reasoning_items")),
-            _reasoning_json_text(msg.get("codex_message_items")),
-            msg.get("platform_message_id") or msg.get("message_id"),
-            1 if msg.get("observed") else 0, 1 if msg.get("_compressed_summary") else 0,
-            _payload_bytes(_scrub(msg.get("api_content"))), _scrub(msg.get("display_kind")),
-            display_metadata, _display_identity(_display_dedupe_key(identity_row)),
-            message_uid_or_none(msg), _absorbed_uids_json(msg),
-            _tool_call_uids_json(msg), _tool_call_uid_or_none(msg),
-        )
+    def conversation_revision(self, session_id: SessionId, *, include_lineage: bool = False) -> ConversationRevision:
+        store = self._store
+        with _refusals(store, session_id):
+            ids, count, max_id, revision = _reads.conversation_revision(
+                store, str(session_id), include_ancestors=include_lineage)
+        return ConversationRevision(lineage_ids=tuple(SessionId(i) for i in ids), active_count=count,
+                                    max_active_id=max_id, transcript_revision=revision)
 
-    def _stamp_tool_call_uids(self, msg: dict[str, Any], tool_calls: Any, batch_index: dict[str, str]) -> None:
-        """Per-occurrence tool-call identity at insert (the SQLite ``_stamp_tool_call_uids``)."""
-        role = msg.get("role")
-        if role == "assistant" and tool_calls:
-            uids = _tool_call_uid_map(msg)
-            for tc in tool_calls:
-                call_id = coalesce_tool_call_id(tc)
-                if call_id and call_id not in uids:
-                    uids[call_id] = mint_uid()
-            if uids:
-                msg[TOOL_CALL_UIDS] = uids
-            index_tool_call_uids(batch_index, msg)
-        elif role == "user":
-            batch_index.clear()
-        elif role == "tool" and _tool_call_uid_or_none(msg) is None:
-            # A tool-result row resolves its call id through the batch index (the same batch's
-            # assistant rows), any id variant the SQLite ``resolve_tool_call_uid`` walks.
-            uid = resolve_tool_call_uid(batch_index, msg.get("tool_call_id"))
-            if uid:
-                msg["_tool_call_uid"] = uid
+    def read_conversation(self, session_id: SessionId,
+                         request: ConversationRequest = ConversationRequest()) -> tuple[ConversationMessage, ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            messages = _reads.get_messages_as_conversation(
+                store, str(session_id),
+                include_ancestors=request.include_lineage,
+                include_inactive=request.view is TranscriptView.ALL,
+                repair_alternation=request.repair_alternation,
+                include_row_ids=request.include_row_ids,
+                include_compacted=request.view is TranscriptView.DISPLAY)
+        return tuple(ConversationMessage.from_openai_message(m) for m in messages)
 
-    def _bump_session_counters(self, conn, session_id: str, inserted: int, tool_calls: int) -> None:
-        """Bump the session's message and tool-call counters after an insert (the SQLite
-        ``_bump_session_counters``)."""
-        if tool_calls > 0:
-            conn.execute(
-                "UPDATE sessions SET message_count = message_count + 1, "
-                "tool_call_count = tool_call_count + %s WHERE id = %s",
-                (tool_calls, session_id),
-            )
-        elif inserted > 0:
-            conn.execute(
-                "UPDATE sessions SET message_count = message_count + 1 WHERE id = %s",
-                (session_id,),
-            )
+    def read_resume_conversations(self, session_id: SessionId) -> ResumeConversations:
+        store = self._store
+        with _refusals(store, session_id):
+            model, display = _reads.get_resume_conversations(store, str(session_id))
+        return ResumeConversations(model=tuple(ConversationMessage.from_openai_message(m) for m in model),
+                                   display=tuple(ConversationMessage.from_openai_message(m) for m in display))
+
+    def assert_resume_safe(self, session_id: SessionId, *, max_messages: int, tip_only: bool = False) -> int:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.assert_resume_safe(store, str(session_id), max_messages, tip_only=tip_only)
+
+    def read_around(self, session_id: SessionId, anchor: MessageId, *, window: int = 5) -> AnchoredWindow:
+        store = self._store
+        with _refusals(store, session_id):
+            around = _reads.get_messages_around(store, str(session_id), int(anchor), window=window)
+        return AnchoredWindow(window=tuple(_message_record(r) for r in around["window"]),
+                              before=around["messages_before"], after=around["messages_after"])
+
+    def read_anchored_view(self, session_id: SessionId, anchor: MessageId, *, window: int = 5, bookend: int = 3,
+                           keep_roles: Optional[tuple[str, ...]] = ("user", "assistant")) -> AnchoredView:
+        store = self._store
+        with _refusals(store, session_id):
+            bookend = max(bookend, 0)
+            primitive = _reads.get_messages_around(store, str(session_id), int(anchor), window=window)
+            window_rows = primitive["window"]
+            if not window_rows:
+                return AnchoredView(window=(), before=0, after=0, bookend_start=(), bookend_end=())
+            filtered_window = window_rows
+            if keep_roles is not None:
+                keep_set = set(keep_roles)
+                filtered_window = [m for m in window_rows if m.get("id") == int(anchor) or m.get("role") in keep_set]
+            bookend_start_rows: list[dict[str, Any]] = []
+            bookend_end_rows: list[dict[str, Any]] = []
+            if bookend > 0:
+                role_clause = "" if keep_roles is None else f" AND role IN ({_in_placeholders(len(keep_roles))})"
+                role_params: tuple = () if keep_roles is None else tuple(keep_roles)
+
+                def _bookend(op: str, boundary_id: int, order: str) -> list[dict[str, Any]]:
+                    return store.all(
+                        "SELECT * FROM messages WHERE session_id = %s AND id " + op + " %s" + role_clause +
+                        " AND content IS NOT NULL AND convert_to(content, 'UTF8') <> '' "
+                        "ORDER BY id " + order + " LIMIT %s",
+                        (str(session_id), boundary_id, *role_params, bookend))
+
+                bookend_start_rows = _bookend("<", window_rows[0]["id"], "ASC")
+                bookend_end_rows = list(reversed(_bookend(">", window_rows[-1]["id"], "DESC")))
+            return AnchoredView(
+                window=tuple(_message_record(r) for r in filtered_window),
+                before=primitive["messages_before"], after=primitive["messages_after"],
+                bookend_start=tuple(_message_record(_store_row_to_message_dict(r, summary_flag=False))
+                                   for r in bookend_start_rows),
+                bookend_end=tuple(_message_record(_store_row_to_message_dict(r, summary_flag=False))
+                                 for r in bookend_end_rows))
+
+    def find_pr_url_hits(self, session_ids: Sequence[SessionId]) -> tuple[PrUrlHit, ...]:
+        store = self._store
+        with _refusals(store):
+            hits = _reads.find_pr_url_messages(store, [str(s) for s in session_ids])
+        return tuple(PrUrlHit(session_id=SessionId(str(h["session_id"])), content=h["content"]) for h in hits)
+
+    def latest_todo_result(self, session_id: SessionId, *, max_chars: int) -> Optional[str]:
+        store = self._store
+        with _refusals(store, session_id):
+            return self._latest_todo_result(store, str(session_id), max_chars)
+
+    def read_session_timeline(self, session_id: SessionId, *, limit: int = 500,
+                             after_row_id: int = 0) -> SessionTimeline:
+        store = self._store
+        with _refusals(store, session_id):
+            result = _timeline.get_session_timeline(store, str(session_id), limit=limit, after_row_id=after_row_id)
+        page = result["pagination"]
+        return SessionTimeline(
+            entries=tuple(TimelineEntry(row_id=MessageId(e["row_id"]), preview=e["preview"],
+                                       timestamp=e["timestamp"]) for e in result["entries"]),
+            limit=page["limit"], after_row_id=page["after_row_id"], returned=page["returned"],
+            total=page["total"], has_more=page["has_more"], next_cursor=page["next_cursor"])
+
+    def read_prompt_page(self, session_id: SessionId, row_id: MessageId, *, limit: int = 120) -> Optional[PromptPage]:
+        store = self._store
+        with _refusals(store, session_id):
+            result = _timeline.get_session_messages_around(store, str(session_id), int(row_id), limit=limit)
+        if result is None:
+            return None
+        page = result["pagination"]
+        return PromptPage(
+            messages=tuple(_transcript_row(r) for r in result["messages"]), row_id=MessageId(page["row_id"]),
+            limit=page["limit"], returned=page["returned"], offset=page["offset"], total=page["total"],
+            has_older=page["has_older"], has_newer=page["has_newer"])
+
+    def latest_conversation_role(self, session_id: SessionId) -> Optional[str]:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.latest_conversation_role(store, str(session_id))
+
+    def latest_dialogue_message(self, session_id: SessionId) -> Optional[str]:
+        store = self._store
+        with _refusals(store, session_id):
+            row = store.one(
+                "SELECT content FROM messages WHERE session_id = %s AND role IN ('user', 'assistant') "
+                "AND active = 1 AND content IS NOT NULL AND TRIM(convert_to(content, 'UTF8')) <> '' "
+                "ORDER BY id DESC LIMIT 1", str(session_id))
+        return None if row is None else _payload_str(row["content"])
+
+    def message_storage_state(self, message_id: MessageId) -> Optional[MessageStorageState]:
+        if not message_id:
+            return None
+        store = self._store
+        with _refusals(store):
+            row = store.one("SELECT session_id, active, compacted FROM messages WHERE id = %s", int(message_id))
+        if row is None:
+            return None
+        return MessageStorageState(session_id=SessionId(str(row["session_id"])),
+                                   visibility=_visibility(row["active"], row["compacted"]))
+
+    def latest_row_id(self, session_id: SessionId, *, role: str = "user", offset: int = 0,
+                      require_text: bool = True) -> Optional[MessageId]:
+        store = self._store
+        with _refusals(store, session_id):
+            row_id = _reads.latest_message_row_id(store, str(session_id), role=role, offset=offset,
+                                                 require_text=require_text)
+        return None if row_id is None else MessageId(row_id)
+
+    def message_role(self, session_id: SessionId, message_id: MessageId) -> Optional[str]:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.get_message_role(store, str(session_id), int(message_id))
+
+    def resolve_active_row_id(self, session_id: SessionId, message_id: MessageId) -> Optional[MessageId]:
+        store = self._store
+        with _refusals(store, session_id):
+            row_id = _reads.resolve_active_row_id(store, str(session_id), int(message_id))
+        return None if row_id is None else MessageId(row_id)
+
+    def rewritten_held_row_ids(self, session_id: SessionId, held: Sequence[HeldMessage]) -> tuple[MessageId, ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            return tuple(MessageId(i) for i in _store_rewritten_held_row_ids(
+                store, str(session_id), [_held_dict(m) for m in held]))
+
+    def plan_user_turn_rewind(self, session_id: SessionId, user_ordinal: int, *,
+                             warm_history: Optional[Sequence[Mapping[str, Any]]] = None,
+                             require_retryable: bool = False, require_composite: bool = False) -> _RewindPlanRecord:
+        store = self._store
+        with _refusals(store, session_id):
+            plan = _store_plan_user_turn_rewind(
+                store, str(session_id), user_ordinal,
+                warm_history=None if warm_history is None else [dict(m) for m in warm_history],
+                require_retryable=require_retryable, require_composite=require_composite)
+        return _RewindPlanRecord(
+            target_row_id=MessageId(plan.target_row_id),
+            expected_active_ids=tuple(MessageId(i) for i in plan.expected_active_ids),
+            expected_target_content=plan.expected_target_content, scaffold=plan.scaffold,
+            prefix=tuple(plan.prefix), durable_prefix=tuple(plan.durable_prefix),
+            live_view=plan.live_view, live_text=plan.live_text,
+            durable_user=tuple(plan.durable_user), user_ordinal=plan.user_ordinal)
+
+    def has_platform_message_id(self, session_id: SessionId, platform_message_id: str) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.has_platform_message_id(store, str(session_id), platform_message_id)
+
+    def has_gateway_input_owner(self, session_id: SessionId, owner: str) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return _reads.has_gateway_input_owner(store, str(session_id), owner)
+
+    def latest_conversation_boundary(self, peer: ConversationPeer) -> Optional[int]:
+        store = self._store
+        with _refusals(store):
+            return _reads.latest_conversation_boundary(store, peer.session_key, peer.source)
+
+    def read_compression_cooldown(self, session_id: SessionId, at: float) -> Optional[CompressionCooldown]:
+        snapshot = self.read_compression_cooldown_snapshot(session_id)
+        if snapshot.until is None or float(snapshot.until) <= at:
+            return None
+        return CompressionCooldown(until=float(snapshot.until), error=snapshot.error)
+
+    def read_compression_cooldown_snapshot(self, session_id: SessionId) -> CooldownSnapshot:
+        store = self._store
+        with _refusals(store, session_id):
+            row = _writes.get_compression_failure_cooldown_row(store, str(session_id))
+        if not row["session_exists"]:
+            return CooldownSnapshot(present=False)
+        return CooldownSnapshot(present=True, until=row["cooldown_until"], error=row["error"])
+
+    def terminal_tool_call_payloads(self, *, since_ts: float) -> Iterator[str]:
+        store = self._store
+        with _refusals(store):
+            for row in store.all(
+                    "SELECT tool_calls FROM messages WHERE role = 'assistant' AND tool_calls IS NOT NULL "
+                    "AND tool_calls LIKE '%terminal%' AND timestamp >= %s", since_ts):
+                yield row["tool_calls"]
+
+    def blocked_tool_result_payloads(self, *, since_ts: float) -> Iterator[tuple[str, Optional[str]]]:
+        store = self._store
+        with _refusals(store):
+            for row in store.all(
+                    "SELECT tool_call_id, content FROM messages WHERE role = 'tool' AND tool_call_id IS NOT NULL "
+                    "AND timestamp >= %s AND (convert_to(content, 'UTF8') LIKE '%BLOCKED%' "
+                    "OR convert_to(content, 'UTF8') LIKE '%approval%')", since_ts):
+                yield (row["tool_call_id"], _payload_str(row["content"]))
+
+    def has_any_message(self) -> bool:
+        store = self._store
+        with _refusals(store):
+            return store.one("SELECT 1 FROM messages LIMIT 1") is not None
+
+    def spillover_reference_rows(self) -> Iterator[tuple[Optional[str], Optional[str]]]:
+        # No row cap: a capped read answered "unknown" past it and the sweep then kept every file for good.
+        store = self._store
+        with _refusals(store):
+            for row in store.all(
+                    "SELECT content, api_content FROM messages WHERE "
+                    "(convert_to(content, 'UTF8') LIKE '%spillover%' OR convert_to(api_content, 'UTF8') LIKE '%spillover%' "
+                    "OR convert_to(content, 'UTF8') LIKE '%cache/pruned/%' OR convert_to(api_content, 'UTF8') LIKE '%cache/pruned/%')"):
+                yield (_payload_str(row["content"]), _payload_str(row["api_content"]))
+
+    def read_snapshot(self):
+        """Every read this thread makes through this store inside the block sees one generation (the store's
+        second-connection REPEATABLE READ snapshot, re-entrant)."""
+        return self._store.transcript_read_snapshot()
+
+    def display_index_complete(self, session_id: SessionId) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return _store_display_index_complete(store, str(session_id))
+
+    def ensure_display_index(self, session_id: SessionId) -> bool:
+        store = self._store
+        with _refusals(store, session_id):
+            return _ensure_display_index(store, str(session_id))
+
+    def display_generations(self, session_id: SessionId, lineage_ids: Sequence[SessionId]) -> tuple["PagedMessage", ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            found = _store_display_generations(store, str(session_id), [str(s) for s in lineage_ids])
+        return tuple(PagedMessage(message=ConversationMessage.from_openai_message(message),
+                                  position=int(durable), durable_id=MessageId(int(durable)))
+                     for message, durable in found)
+
+    def transcript_segment_page(self, session_id: SessionId, *, latest: bool, after: Optional[tuple[int, int]],
+                               count: int, inclusive: bool = False) -> SegmentPage:
+        store = self._store
+        with _refusals(store, session_id):
+            found, full, edge, start = _store_segment_page_messages(
+                store, str(session_id), latest=latest,
+                after=None if after is None else (int(after[0]), int(after[1])),
+                count=count, inclusive=inclusive)
+        return SegmentPage(
+            messages=tuple(PagedMessage(message=ConversationMessage.from_openai_message(message),
+                                        position=int(position), durable_id=MessageId(int(durable)))
+                           for message, (position, durable) in found),
+            full=full, edge=None if edge is None else (int(edge[0]), int(edge[1])), start=start)
+
+    def transcript_handoff_rows(self, shown_ids: Sequence[MessageId], segment_ids: Sequence[SessionId]) -> Mapping[MessageId, tuple[TranscriptRow, ...]]:
+        store = self._store
+        with _refusals(store):
+            found = _store_transcript_handoff_rows(store, [int(i) for i in shown_ids],
+                                                   [str(s) for s in segment_ids])
+        return {MessageId(shown): tuple(_transcript_row(row) for row in rows)
+                for shown, rows in found.items()}
+
+    def transcript_handoffs_shown_before(self, session_id: SessionId, before: int,
+                                          handoffs: Sequence[tuple[Optional[str], Any]]) -> tuple[TranscriptRow, ...]:
+        store = self._store
+        with _refusals(store, session_id):
+            rows = _store_transcript_handoffs_shown_before(store, str(session_id), before, handoffs)
+        return tuple(_transcript_row(row) for row in rows)
+
+    def transcript_tool_calls_before(self, segment_ids: Sequence[SessionId], before_id: MessageId, *,
+                                     limit: int = 16) -> tuple[tuple[Optional[str], Optional[str]], ...]:
+        store = self._store
+        with _refusals(store):
+            return tuple(_store_transcript_tool_calls_before(
+                store, [str(s) for s in segment_ids], int(before_id), limit))
+
+    def transcript_cursor_state(self, session_id: SessionId, through_id: MessageId,
+                                lineage_ids: Sequence[SessionId]) -> tuple[int, int, int]:
+        store = self._store
+        with _refusals(store, session_id):
+            return _store_transcript_cursor_state(store, str(session_id), int(through_id),
+                                                 [str(s) for s in lineage_ids])
+
+    # ── the writers' shared doors ──
+
+    def _append_one(self, store: PostgresStore, session_id: SessionId, msg: dict[str, Any], *,
+                    turn_lease_holder: Optional[str], turn_lease_ttl_seconds: float) -> None:
+        """One transcript write: the guards (with their last session-row step), the insert and the
+        counter bump in one transaction (the store's ``append_batch`` door)."""
+        with _refusals(store, session_id):
+            _writes.append_batch(store, str(session_id), [msg], turn_lease_holder=turn_lease_holder,
+                                 turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+
+    def _append_detached_result(self, store: PostgresStore, session_id: SessionId, content: str,
+                               display_kind: str, metadata: dict[str, Any], match_sql: str,
+                               params: tuple) -> int:
+        """Record a between-turns result as ONE user row, including replay after a compression rotation: a
+        row ``match_sql`` finds in the compression lineage is returned instead of a fresh insert. Check and
+        insert share the write transaction, so independent gateway processes cannot duplicate it; a live turn
+        or a closed-by-compression session refuses (the SQLite ``_append_detached_result`` port; the
+        session-row step is the guard's last check, after the live-turn fence)."""
+        from persistence.sqlite.conversation._store.rules import stamp_message_uid
+        from ._store.common import _bump_session_counters, _message_row_params as _pg_message_row_params
+        msg = {"content": content, "display_kind": display_kind, "display_metadata": metadata}
+        stamp_message_uid(msg)  # a fresh occurrence: mint its durable id
+        now = time.time()
+        row = _pg_message_row_params(str(session_id), "user", msg, None, now, keep_reasoning=True)
+
+        # The compression lineage: root -> tip, each hop's parent ended compression (the SQLite
+        # ``_LINEAGE_MATCH_SQL`` recursive CTE, precomputed over the read path and expanded as an IN list).
+        lineage_ids = _reads._resume_lineage_ids(store, str(session_id))
+        marks = _in_placeholders(len(lineage_ids))
+        match_params = [str(i) for i in lineage_ids] + list(params)
+
+        def _do(conn) -> int:
+            existing = conn.execute(
+                f"SELECT m.id FROM messages m WHERE m.session_id IN ({marks}) AND "
+                f"({match_sql}) LIMIT 1", match_params).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            _check_transcript_write_guards(conn, str(session_id), None, reject_active_turn_lease=True)
+            from ._store.common import _INSERT_MESSAGE_SQL
+            new_id = conn.execute(_INSERT_MESSAGE_SQL, row).fetchone()
+            _bump_session_counters(conn, str(session_id), 1, 0, unit=True)
+            return int(new_id["id"])
+
+        from ._store.common import _transcript_write
+        return int(_transcript_write(store, [msg], _do))
+
+    def _latest_todo_result(self, store: PostgresStore, session_id: str, max_chars: int) -> Optional[str]:
+        """Newest visible, paired and valid Todo result in the resume display scope (the SQLite
+        ``get_latest_todo_result`` port, over the PG dialect: bytea content through ``convert_to``, the
+        removed-copy check through the display copy identities, the assistant-pair check in Python)."""
+        from persistence.sqlite.conversation._store.identity import _uid_list
+        from persistence.sqlite.conversation._store.rules import MAX_TODO_RESULT_CHARS
+        from ._store.common import _display_dedupe_key, _display_identity
+        if not session_id:
+            return None
+        if max_chars is None:
+            max_chars = MAX_TODO_RESULT_CHARS
+        session_ids = _reads._resume_lineage_ids(store, session_id)
+
+        def _todo_copies(row: Mapping[str, Any], identity: Any = None) -> list[Any]:
+            hashed = identity if identity is not None else _display_identity(_display_dedupe_key(dict(row)))
+            return [hashed, *((("uid", uid) for uid in (row.get("message_uid"), *
+                                                       _uid_list(row.get("absorbed_message_uids"))) if uid))]
+
+        removed: dict[Any, int] = {}
+        marks = _in_placeholders(len(session_ids))
+        removed_rows = store.all(
+            "SELECT id, role, timestamp, tool_call_id, tool_calls, tool_name, message_uid, "
+            "absorbed_message_uids, display_identity, "
+            "CASE WHEN display_identity IS NULL THEN content END AS content "
+            f"FROM messages WHERE session_id IN ({marks}) AND active = 0 AND compacted = 0 "
+            "AND role = 'tool' AND tool_name IN ('todo_list', 'todo')", *session_ids)
+        for row in removed_rows:
+            for copy in _todo_copies(row, row["display_identity"]):
+                removed[copy] = max(removed.get(copy, 0), int(row["id"]))
+
+        for sid in reversed(session_ids):
+            before_id = 2**63 - 1
+            while True:
+                rows = store.all(
+                    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, message_uid, "
+                    f"absorbed_message_uids FROM messages WHERE session_id = %s AND id < %s "
+                    f"AND role = 'tool' AND tool_name IN ('todo_list', 'todo') AND (active = 1 OR compacted = 1) "
+                    f"AND length(convert_to(content, 'UTF8')) <= %s ORDER BY id DESC LIMIT 100",
+                    sid, before_id, max_chars)
+                if not rows:
+                    break
+                for row in rows:
+                    call_id = row["tool_call_id"]
+                    if not call_id or any(removed.get(copy, 0) > int(row["id"])
+                                         for copy in _todo_copies(row)):
+                        continue
+                    prior = store.one(
+                        "SELECT role, tool_calls FROM messages WHERE session_id = %s AND id < %s "
+                        "AND role IN ('assistant', 'user', 'system') AND (active = 1 OR compacted = 1) "
+                        "ORDER BY id DESC LIMIT 1", sid, int(row["id"]))
+                    if prior is None or prior["role"] != "assistant":
+                        continue
+                    try:
+                        calls = json.loads(prior["tool_calls"]) if prior["tool_calls"] else []
+
+                        def is_todo_call(call: Any) -> bool:
+                            if not isinstance(call, dict) or call.get("id") != call_id:
+                                return False
+                            function = call.get("function")
+                            if not isinstance(function, dict):
+                                return False
+                            if function.get("name") in ("todo_list", "todo"):
+                                return True
+                            if function.get("name") != "tool_call":
+                                return False
+                            arguments = function.get("arguments")
+                            if isinstance(arguments, str):
+                                arguments = json.loads(arguments)
+                            if not isinstance(arguments, dict):
+                                return False
+                            inner_calls = arguments.get("calls")
+                            return isinstance(inner_calls, list) and any(
+                                isinstance(inner, dict) and inner.get("name") in ("todo_list", "todo")
+                                for inner in inner_calls)
+
+                        paired = isinstance(calls, list) and any(is_todo_call(call) for call in calls)
+                        if not paired:
+                            continue
+                        data = json.loads(_payload_str(row["content"]))
+                        if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
+                            continue
+                        int(data.get("revision") or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    return _payload_str(row["content"])
+                before_id = int(rows[-1]["id"])
+        return None
 
 
-def _ended_by_compression(row) -> bool:
-    """A session row ended by a compression boundary (the shared read-side check)."""
-    return row is not None and row["ended_at"] is not None and row["end_reason"] == "compression"
-
-
-add_stubs(PgMessageRepository, MessageRepository, implemented=("append", "read_transcript"))
+add_stubs(PgMessageRepository, MessageRepository, implemented=tuple(sorted(MessageRepository.__protocol_attrs__)))
 
 
 def _register() -> None:
