@@ -27,8 +27,8 @@ __all__ = [
 # stored flag); the bytea body is scanned as UTF-8 text.
 _HANDOFF_PREDICATE = (
     "g.role IN ('user', 'assistant') AND (g._compressed_summary = 1"
-    " OR convert_to(g.content, 'UTF8') LIKE '[CONTEXT COMPACTION%'"
-    " OR convert_to(g.content, 'UTF8') LIKE '[CONTEXT SUMMARY]%')")
+    " OR convert_from(g.content, 'UTF8') LIKE '[CONTEXT COMPACTION%%'"
+    " OR convert_from(g.content, 'UTF8') LIKE '[CONTEXT SUMMARY]%%')")
 
 # The shown rows: their id/uid plus whether they can hold a handoff themselves (every other shown row is
 # read for its id, uid and flag only, so an ordinary page never loads its bodies a second time).
@@ -52,7 +52,7 @@ _HANDOFF_COPIES_SQL = (
 _HANDOFF_SHOWN_BEFORE_SQL = (
     "SELECT DISTINCT g.* FROM messages g JOIN messages w ON w.session_id = g.session_id AND (w.id = g.id OR ("
     "g.message_uid IS NOT NULL AND g.message_uid <> '' AND w.message_uid = g.message_uid AND w.id > g.id))"
-    " WHERE g.session_id = %s AND "
+    " WHERE g.session_id = %s AND ({match}) AND "
     + _HANDOFF_PREDICATE
     + " AND w.display_order < %s AND w.id = (SELECT candidate.id FROM messages AS candidate"
     " WHERE candidate.session_id = %s AND candidate.display_order = w.display_order"
@@ -163,7 +163,7 @@ def transcript_handoffs_shown_before(store, segment: str, before: int,
         match.append("g.message_uid = ANY(%s)")
         params.append(uids)
     if contents:
-        match.append("(g.message_uid IS NULL OR g.message_uid = '') AND convert_to(g.content, 'UTF8') = ANY(%s)")
+        match.append("(g.message_uid IS NULL OR g.message_uid = '') AND convert_from(g.content, 'UTF8') = ANY(%s)")
         params.append(contents)
     if not match:
         return []

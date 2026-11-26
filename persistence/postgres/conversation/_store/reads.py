@@ -161,7 +161,8 @@ def display_message_count(store, session_id: str) -> int:
     valid JSON or NULL)."""
     n = store.scalar(
         "SELECT COUNT(*) FROM (SELECT DISTINCT display_order FROM messages WHERE session_id = %s"
-        f"{_DISPLAY_ACTIVE_CLAUSE}{DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql('messages')})")
+        f"{_DISPLAY_ACTIVE_CLAUSE}{DISPLAY_VISIBLE_SQL}{not_a_later_tool_copy_sql('messages')})",
+        session_id)
     return int(n or 0)
 
 
@@ -227,7 +228,7 @@ def find_pr_url_messages(store, session_ids: list[str]) -> list[dict[str, Any]]:
         rows = store.all(
             """SELECT session_id, content FROM messages
                     WHERE session_id IN (""" + _in_placeholders(len(chunk)) + """)
-                      AND role = 'tool' AND convert_to(content, 'UTF8') LIKE '%/pull/%'
+                      AND role = 'tool' AND convert_from(content, 'UTF8') LIKE '%%/pull/%%'
                     ORDER BY id ASC""",
             *chunk)
         out.extend({"session_id": row["session_id"], "content": _json_value_or(
@@ -500,7 +501,7 @@ def latest_message_row_id(store, session_id: str, *, role: str = "user", offset:
     trimmed as UTF-8 text)."""
     if not session_id or role not in {"user", "assistant"} or offset < 0:
         return None
-    text_filter = "AND content IS NOT NULL AND TRIM(convert_to(content, 'UTF8')) <> '' " if require_text else ""
+    text_filter = "AND content IS NOT NULL AND TRIM(convert_from(content, 'UTF8')) <> '' " if require_text else ""
     row = store.one(
         "SELECT id FROM messages WHERE session_id = %s AND role = %s "
         f"AND active = 1 {text_filter}ORDER BY id DESC LIMIT 1 OFFSET %s",
@@ -527,7 +528,7 @@ def get_message_role(store, session_id: str, row_id: int) -> Optional[str]:
 
 def resolve_active_row_id(store, session_id: str, row_id: int) -> Optional[int]:
     """The active row that still carries *row_id*'s message (the SQLite ``resolve_active_row_id``
-    port; the bytea ``content`` compares with PG's null-safe ``IS``)."""
+    port; the bytea ``content`` compares with PG's null-safe ``IS NOT DISTINCT FROM``)."""
     if not session_id or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
         return None
     origin = store.one("SELECT active FROM messages WHERE id = %s AND session_id = %s", row_id, session_id)
@@ -538,7 +539,7 @@ def resolve_active_row_id(store, session_id: str, row_id: int) -> Optional[int]:
     clones = store.all(
         "SELECT c.id FROM messages c JOIN messages o ON o.id = %s "
         "WHERE c.session_id = %s AND c.active = 1 AND c.id > o.id AND c.role = o.role "
-        "AND c.content IS o.content AND c.timestamp = o.timestamp",
+        "AND c.content IS NOT DISTINCT FROM o.content AND c.timestamp = o.timestamp",
         row_id, session_id)
     return int(clones[0]["id"]) if len(clones) == 1 else None
 

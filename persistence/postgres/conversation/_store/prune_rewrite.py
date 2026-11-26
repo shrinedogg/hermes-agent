@@ -69,7 +69,7 @@ def _read_only_mismatches(store, session_id: str, held: list[dict[str, Any]]) ->
         return []
     stored: dict[int, Any] = {}
     for rid in by_id:
-        row = store.one("SELECT * FROM messages WHERE session_id = %s AND id = %s", (session_id, rid))
+        row = store.one("SELECT * FROM messages WHERE session_id = %s AND id = %s", session_id, rid)
         if row is not None:
             stored[int(row["id"])] = row
     mismatches: list[int] = []
@@ -80,7 +80,7 @@ def _read_only_mismatches(store, session_id: str, held: list[dict[str, Any]]) ->
     for uid, m in by_uid.items():
         row = store.one(
             "SELECT * FROM messages WHERE session_id = %s AND active = 1 AND role = %s AND message_uid = %s "
-            "ORDER BY id DESC LIMIT 1", (session_id, m.get("role"), uid))
+            "ORDER BY id DESC LIMIT 1", session_id, m.get("role"), uid)
         if row is not None and _mismatch_for(m, row):
             mismatches.append(int(row["id"]))
     return mismatches

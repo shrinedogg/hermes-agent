@@ -11,6 +11,10 @@ from session_rules.turns import sanitize_context, split_user_originated_turn
 from persistence.conversation.messages import CONTENT_REFUSED_DISPLAY_KIND, CONTENT_REFUSED_METADATA_KEY
 from persistence.sqlite.conversation._store.rules import DB_ROW_SNAPSHOT
 from persistence.sqlite.conversation._store.messages_sql import _tool_calls_len
+# The store-level refusal is the SQLite twin's class (re-exported, not redefined): the backend's
+# ``refusals`` maps that one class to the contract's ``RewindTargetUnavailable`` — a local duplicate
+# would bypass the mapping and leak the store error into the contract.
+from persistence.sqlite.conversation._store.rewind import RewindTargetUnavailableError
 from .common import (
     _ACTIVE_IDS_SQL, _SET_COUNTERS_SQL, _check_transcript_write_guards, _decode_content,
     _decode_display_metadata, _decode_payloads, _payload_str, _transcript_write,
@@ -22,12 +26,6 @@ __all__ = [
 ]
 
 _HISTORY_CHANGED = "session history changed before the rewind could be persisted"
-
-
-class RewindTargetUnavailableError(ValueError):
-    """The requested user turn is not a rewindable target of the active transcript: no user turns, an
-    ordinal past the newest one, a row that is not user-originated, or a plain turn where the caller
-    required a compaction carrier. Surfaces map this to their own "nothing to undo" message."""
 
 
 @dataclass
@@ -213,7 +211,7 @@ def _plan_refused_retention(store, session_id: str, boundary_row_id: Optional[in
     if isinstance(boundary_row_id, int) and boundary_row_id > 0:
         row = store.one(
             "SELECT role, active, content, display_metadata FROM messages "
-            "WHERE id = %s AND session_id = %s", (boundary_row_id, session_id))
+            "WHERE id = %s AND session_id = %s", boundary_row_id, session_id)
         if row is not None and row["role"] == "user" and row["active"]:
             decoded = {"role": "user", "content": _decode_content(_payload_str(row["content"])),
                        "display_metadata": _decode_display_metadata(row["display_metadata"])}

@@ -1,6 +1,6 @@
 """Shared PG-dialect plumbing for the ported conversation store: ``%s`` placeholder expansion, the BYTEA
 payload columns (``content``/``api_content``/``reasoning_content`` are UTF-8 bytes; text work goes through
-``convert_to(…, 'UTF8')``), the ported SQL constants, and the display-index maintenance the DDL display
+``convert_from(…, 'UTF8')``), the ported SQL constants, and the display-index maintenance the DDL display
 triggers leave to the write verbs (a content/display-kind update NULLs the row's identity; the verb
 re-folds in-transaction)."""
 
@@ -63,15 +63,20 @@ def _phs(count: int) -> str:
 
 
 def _in_placeholders(items) -> str:
-    """``(%s, %s, %s)`` for one bound parameter per element of *items*; an empty list is ``(NULL)``."""
-    ids = list(items)
-    return f"({', '.join(['%s'] * len(ids))})" if ids else "(NULL)"
+    """``%s, %s, %s`` — one bound parameter per element of *items* (or per *count* when an int is
+    passed; the SQLite ``_placeholders`` twin), no surrounding parens: every caller wraps the
+    result in its own ``IN (``…``))``; an empty list/count renders ``NULL``."""
+    if isinstance(items, int):
+        count = items
+    else:
+        count = len(list(items))
+    return ", ".join(["%s"] * count) if count else "NULL"
 
 
-# ── BYTEA payload columns: text work through convert_to ──
+# ── BYTEA payload columns: text work through convert_from ──
 
-CONTENT_TEXT = "convert_to(content, 'UTF8')"
-API_CONTENT_TEXT = "convert_to(api_content, 'UTF8')"
+CONTENT_TEXT = "convert_from(content, 'UTF8')"
+API_CONTENT_TEXT = "convert_from(api_content, 'UTF8')"
 
 
 def _payload_bytes(value: Any) -> Optional[bytes]:
@@ -192,7 +197,7 @@ _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE sessi
 
 _SHADOWED_CHECKPOINT_ROWS_SQL = ("SELECT id, codex_reasoning_items FROM messages WHERE session_id = %s "
                                 "AND active = 1 AND role = 'assistant' AND id < %s "
-                                "AND codex_reasoning_items LIKE '%\"compaction\"%'")
+                                "AND codex_reasoning_items LIKE '%%\"compaction\"%%'")
 
 
 _SET_CODEX_REASONING_SQL = "UPDATE messages SET codex_reasoning_items = %s WHERE id = %s"
@@ -226,7 +231,10 @@ def _encode_content(content: Any) -> Any:
 
 
 def _decode_content(content: Any) -> Any:
-    """Reverse ``_encode_content``: a reserved-prefix string that isn't valid JSON reads back raw."""
+    """Reverse ``_encode_content``: a reserved-prefix string that isn't valid JSON reads back raw. A
+    stored BYTEA payload (a raw row, never a projected dict) decodes to UTF-8 text first."""
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        content = bytes(content).decode("utf-8")
     if isinstance(content, str) and content.startswith(_CONTENT_JSON_PREFIX):
         return _json_value_or(content[len(_CONTENT_JSON_PREFIX):], content, "raw JSON content")
     return content
@@ -426,11 +434,13 @@ def _message_row_params(session_id: str, role: str, msg: dict[str, Any], tool_ca
 
 def _serialized_message_row(session_id: str, msg: dict[str, Any], message_timestamp: float) -> dict[str, Any]:
     """Serialize one live message with the exact durable shape used by INSERT (the SQLite
-    ``_serialized_message_row``)."""
+    ``_serialized_message_row``). The INSERT's ``active`` is a SQL literal (``1``), so the bound
+    values zip against the column list with that literal excluded — a plain zip against the full
+    list would shift every column after it by one."""
     role = msg.get("role", "unknown")
     params = _message_row_params(session_id, role, msg, _parse_tool_calls(msg.get("tool_calls")),
                                  message_timestamp, keep_reasoning=role == "assistant")
-    return dict(zip(_MESSAGE_WRITE_COLUMNS, params))
+    return dict(zip((c for c in _MESSAGE_WRITE_COLUMNS if c != "active"), params))
 
 
 def _bump_session_counters(conn, session_id: str, inserted: int, tool_calls: int, *, unit: bool = False) -> None:
@@ -689,8 +699,10 @@ def _clone_message_rows(conn, tail_ids: list[int], *, session_id: Optional[str] 
                "ORDER BY id")
         conn.execute(sql, (session_id, *tail_ids))
     else:
-        sql = (f"INSERT INTO messages ({col_list}, active, compacted) "
-               f"SELECT {select_cols}, 1, 0 FROM messages WHERE id IN ({_in_placeholders(tail_ids)}) "
+        # Same-session clone: the source row's own session_id rides the clone (a NULL would violate
+        # the NOT NULL constraint; the SQLite twin copies it in col_list when not retargeting).
+        sql = (f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
+               f"SELECT {select_cols}, session_id, 1, 0 FROM messages WHERE id IN ({_in_placeholders(tail_ids)}) "
                "ORDER BY id")
         conn.execute(sql, tuple(tail_ids))
 

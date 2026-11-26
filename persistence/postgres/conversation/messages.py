@@ -12,7 +12,7 @@ error family through ``refusals`` (plus the rewind's verbatim refusal texts to `
 Porting notes (recorded for the stage-1 review): the payload columns (``content``/``api_content``/
 ``reasoning_content``) are BYTEA (PostgreSQL ``text`` cannot hold the NUL the ``\\x00json:``
 sentinel encoding carries); every SQL comparison of a payload body goes through
-``convert_to(..., 'UTF8')`` and Python work through ``_payload_str``/``_payload_bytes``. Display
+``convert_from(..., 'UTF8')`` and Python work through ``_payload_str``/``_payload_bytes``. Display
 identity is the plain dedupe key (role, content, timestamp, tool_call_id, tool_calls, tool_name,
 with the stable tool-call key for assistant rows). The detached-result appends (completion notes,
 delegation deliveries) and the latest-todo-result walk are ported here over the store's read and
@@ -294,9 +294,12 @@ class PgMessageRepository:
     def append(self, session_id: SessionId, message: NewMessage, *,
                turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> MessageId:
         """Append one row and bump the session counters in one transaction; returns its id (the protocol
-        docstring's refusals: ``TurnLeaseLost``, ``CompressionClosed``, ``SessionRowMissing``)."""
+        docstring's refusals: ``TurnLeaseLost``, ``CompressionClosed``, ``SessionRowMissing``). A single
+        append drops ``data_use`` (only the batch door folds it into display_metadata — the SQLite
+        ``append`` field-based port)."""
         store = self._store
         msg = _message_dict(message)
+        msg.pop("data_use", None)
         self._append_one(store, session_id, msg, turn_lease_holder=turn_lease_holder,
                          turn_lease_ttl_seconds=turn_lease_ttl_seconds)
         return MessageId(int(msg["_row_id"]))
@@ -626,9 +629,9 @@ class PgMessageRepository:
                 def _bookend(op: str, boundary_id: int, order: str) -> list[dict[str, Any]]:
                     return store.all(
                         "SELECT * FROM messages WHERE session_id = %s AND id " + op + " %s" + role_clause +
-                        " AND content IS NOT NULL AND convert_to(content, 'UTF8') <> '' "
+                        " AND content IS NOT NULL AND convert_from(content, 'UTF8') <> '' "
                         "ORDER BY id " + order + " LIMIT %s",
-                        (str(session_id), boundary_id, *role_params, bookend))
+                        str(session_id), boundary_id, *role_params, bookend)
 
                 bookend_start_rows = _bookend("<", window_rows[0]["id"], "ASC")
                 bookend_end_rows = list(reversed(_bookend(">", window_rows[-1]["id"], "DESC")))
@@ -685,7 +688,7 @@ class PgMessageRepository:
         with _refusals(store, session_id):
             row = store.one(
                 "SELECT content FROM messages WHERE session_id = %s AND role IN ('user', 'assistant') "
-                "AND active = 1 AND content IS NOT NULL AND TRIM(convert_to(content, 'UTF8')) <> '' "
+                "AND active = 1 AND content IS NOT NULL AND TRIM(convert_from(content, 'UTF8')) <> '' "
                 "ORDER BY id DESC LIMIT 1", str(session_id))
         return None if row is None else _payload_str(row["content"])
 
@@ -776,7 +779,7 @@ class PgMessageRepository:
         with _refusals(store):
             for row in store.all(
                     "SELECT tool_calls FROM messages WHERE role = 'assistant' AND tool_calls IS NOT NULL "
-                    "AND tool_calls LIKE '%terminal%' AND timestamp >= %s", since_ts):
+                    "AND tool_calls LIKE '%%terminal%%' AND timestamp >= %s", since_ts):
                 yield row["tool_calls"]
 
     def blocked_tool_result_payloads(self, *, since_ts: float) -> Iterator[tuple[str, Optional[str]]]:
@@ -784,8 +787,8 @@ class PgMessageRepository:
         with _refusals(store):
             for row in store.all(
                     "SELECT tool_call_id, content FROM messages WHERE role = 'tool' AND tool_call_id IS NOT NULL "
-                    "AND timestamp >= %s AND (convert_to(content, 'UTF8') LIKE '%BLOCKED%' "
-                    "OR convert_to(content, 'UTF8') LIKE '%approval%')", since_ts):
+                    "AND timestamp >= %s AND (convert_from(content, 'UTF8') LIKE '%%BLOCKED%%' "
+                    "OR convert_from(content, 'UTF8') LIKE '%%approval%%')", since_ts):
                 yield (row["tool_call_id"], _payload_str(row["content"]))
 
     def has_any_message(self) -> bool:
@@ -799,8 +802,8 @@ class PgMessageRepository:
         with _refusals(store):
             for row in store.all(
                     "SELECT content, api_content FROM messages WHERE "
-                    "(convert_to(content, 'UTF8') LIKE '%spillover%' OR convert_to(api_content, 'UTF8') LIKE '%spillover%' "
-                    "OR convert_to(content, 'UTF8') LIKE '%cache/pruned/%' OR convert_to(api_content, 'UTF8') LIKE '%cache/pruned/%')"):
+                    "(convert_from(content, 'UTF8') LIKE '%spillover%' OR convert_from(api_content, 'UTF8') LIKE '%spillover%' "
+                    "OR convert_from(content, 'UTF8') LIKE '%cache/pruned/%' OR convert_from(api_content, 'UTF8') LIKE '%cache/pruned/%')"):
                 yield (_payload_str(row["content"]), _payload_str(row["api_content"]))
 
     def read_snapshot(self):
@@ -917,7 +920,7 @@ class PgMessageRepository:
 
     def _latest_todo_result(self, store: PostgresStore, session_id: str, max_chars: int) -> Optional[str]:
         """Newest visible, paired and valid Todo result in the resume display scope (the SQLite
-        ``get_latest_todo_result`` port, over the PG dialect: bytea content through ``convert_to``, the
+        ``get_latest_todo_result`` port, over the PG dialect: bytea content through ``convert_from``, the
         removed-copy check through the display copy identities, the assistant-pair check in Python)."""
         from persistence.sqlite.conversation._store.identity import _uid_list
         from persistence.sqlite.conversation._store.rules import MAX_TODO_RESULT_CHARS
@@ -952,7 +955,7 @@ class PgMessageRepository:
                     "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, message_uid, "
                     f"absorbed_message_uids FROM messages WHERE session_id = %s AND id < %s "
                     f"AND role = 'tool' AND tool_name IN ('todo_list', 'todo') AND (active = 1 OR compacted = 1) "
-                    f"AND length(convert_to(content, 'UTF8')) <= %s ORDER BY id DESC LIMIT 100",
+                    f"AND length(convert_from(content, 'UTF8')) <= %s ORDER BY id DESC LIMIT 100",
                     sid, before_id, max_chars)
                 if not rows:
                     break

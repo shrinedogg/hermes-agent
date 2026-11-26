@@ -575,10 +575,17 @@ def get_compression_failure_cooldown_row(store, session_id: str) -> dict[str, An
 
 
 def record_compression_failure_cooldown(store, session_id: str, until: float, error: Optional[str] = None) -> None:
+    """Persist the active compression-failure cooldown (the SQLite port: merge-max with any longer live
+    deadline so a later shorter write can't reopen the thrash window; the error always takes the latest
+    diagnostic)."""
     def _do(conn) -> None:
-        conn.execute("UPDATE sessions SET compression_failure_cooldown_until = %s, "
+        conn.execute("UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                     "WHEN compression_failure_cooldown_until IS NOT NULL "
+                     "AND compression_failure_cooldown_until > %s "
+                     "THEN compression_failure_cooldown_until ELSE %s END, "
                      "compression_failure_error = %s WHERE id = %s",
-                     (float(until), _sanitize_surrogates(error) if isinstance(error, str) else error,
+                     (float(until), float(until),
+                      _sanitize_surrogates(error) if isinstance(error, str) else error,
                       session_id))
     with store.tx() as conn:
         _do(conn)
@@ -593,26 +600,43 @@ def clear_compression_failure_cooldown(store, session_id: str) -> None:
 
 
 def restore_compression_failure_cooldown_row(store, session_id: str, row: Mapping[str, Any]) -> None:
-    """Restore a session's cooldown from a caller-captured snapshot (the SQLite port: a snapshot for a
-    vanished session refuses with ``RuntimeError``, the verb maps it to ``CooldownRestoreRefused``)."""
-    def _do(conn) -> None:
-        if not row.get("session_exists"):
-            if conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is None:
-                raise RuntimeError(f"session {session_id!r} no longer exists; its compression cooldown "
-                                   "cannot be restored")
-            until = row.get("cooldown_until")
-            error = row.get("error")
-            conn.execute("UPDATE sessions SET compression_failure_cooldown_until = %s, "
-                         "compression_failure_error = %s WHERE id = %s",
-                         (float(until) if until is not None else None,
-                          error, session_id))
-            return
-        existing = conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone()
-        if existing is None:
-            raise RuntimeError(f"session {session_id!r} no longer exists; its compression cooldown "
-                               "cannot be restored")
+    """Restore and verify an exact cooldown-row snapshot (the SQLite port: unlike record/clear this
+    rollback API propagates write and verification failures; the tolerated exception is a session row
+    that vanished mid-attempt, since its cooldown died with it)."""
+    def _exists(conn) -> bool:
+        return conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is not None
+
+    def _actual(conn) -> dict[str, Any]:
+        sess = conn.execute("SELECT compression_failure_cooldown_until, compression_failure_error "
+                            "FROM sessions WHERE id = %s", (session_id,)).fetchone()
+        if sess is None:
+            return {"session_exists": False, "cooldown_until": None, "error": None}
+        return {"session_exists": True,
+                "cooldown_until": float(sess["compression_failure_cooldown_until"])
+                if sess["compression_failure_cooldown_until"] is not None else None,
+                "error": sess["compression_failure_error"]}
+
+    if not row.get("session_exists"):
+        with store.tx() as conn:
+            if _exists(conn):
+                raise RuntimeError("cannot restore absent compression cooldown row: session now exists")
+        return
+    deadline = row.get("cooldown_until")
+    error = row.get("error")
     with store.tx() as conn:
-        _do(conn)
+        written = conn.execute("UPDATE sessions SET compression_failure_cooldown_until = %s, "
+                               "compression_failure_error = %s WHERE id = %s",
+                               (float(deadline) if deadline is not None else None, error, session_id))
+        if written.rowcount == 0:  # the session vanished before the compensating write: nothing to restore
+            return
+        actual = _actual(conn)
+        expected = {"session_exists": True,
+                    "cooldown_until": float(deadline) if deadline is not None else None,
+                    "error": error}
+        if actual != expected:
+            if actual.get("session_exists"):
+                raise RuntimeError(
+                    f"compression cooldown rollback verification failed: expected={expected!r}, actual={actual!r}")
 
 
 # ── marker purge ──
@@ -624,12 +648,12 @@ def purge_stale_tool_call_markers(store, *, dry_run: bool = False, backup: bool 
     stage-1 review; a logical dump is a stage-6 maintenance concern)."""
     def _find_affected(conn) -> list[int]:
         ids = []
-        for row_id, raw in conn.execute(
+        for row in conn.execute(
                 "SELECT id, content FROM messages WHERE role = 'assistant' "
                 "AND tool_calls IS NOT NULL AND tool_calls != ''").fetchall():
-            content = _payload_str_value(raw)
+            content = _payload_str_value(row["content"])
             if isinstance(content, str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()):
-                ids.append(int(row_id))
+                ids.append(int(row["id"]))
         return ids
 
     affected_ids = store.all("SELECT 1 FROM messages LIMIT 1")
@@ -677,17 +701,16 @@ def append_completion_note(store, session_id: str, admission_id: str, content: s
 # ── api_content / todo ──
 
 def set_latest_user_api_content(store, session_id: str, content: str, api_content: str) -> bool:
-    """Stamp *api_content* on the newest active user row matching *content* (the SQLite
-    ``set_latest_user_api_content`` port)."""
+    """Stamp *api_content* on the newest active user row when its content matches (the SQLite
+    ``set_latest_user_api_content`` port; the stamp addresses the single newest row, never an older
+    row that merely carries the same text)."""
     def _do(conn) -> bool:
-        row = conn.execute(
-            "SELECT id FROM messages WHERE session_id = %s AND role = 'user' AND content = %s "
-            "AND active = 1 ORDER BY id DESC LIMIT 1",
-            (session_id, _payload_bytes_param(_encode_content(content)))).fetchone()
-        if row is None:
-            return False
-        cur = conn.execute("UPDATE messages SET api_content = %s WHERE id = %s",
-                           (_payload_bytes_param(api_content), row["id"]))
+        cur = conn.execute(
+            "UPDATE messages SET api_content = %s WHERE id = (SELECT id FROM messages "
+            "WHERE session_id = %s AND role = 'user' AND active = 1 ORDER BY id DESC LIMIT 1) "
+            "AND content = %s",
+            (_payload_bytes_param(api_content), session_id,
+             _payload_bytes_param(_encode_content(content))))
         return cur.rowcount > 0
     with store.tx() as conn:
         return _do(conn)
@@ -695,11 +718,12 @@ def set_latest_user_api_content(store, session_id: str, content: str, api_conten
 
 def set_message_api_content(store, session_id: str, message_id: int, content: str,
                            api_content: str) -> bool:
-    """Stamp *api_content* on one known row whose content matches (the SQLite port)."""
+    """Stamp *api_content* on one known user row whose content matches (the SQLite port: the ``role``
+    and ``active`` guards stay, so an assistant row or a rewound one is refused)."""
     def _do(conn) -> bool:
         cur = conn.execute(
             "UPDATE messages SET api_content = %s WHERE id = %s AND session_id = %s "
-            "AND content = %s AND active = 1",
+            "AND role = 'user' AND active = 1 AND content = %s",
             (_payload_bytes_param(api_content), message_id, session_id,
              _payload_bytes_param(_encode_content(content))))
         return cur.rowcount > 0

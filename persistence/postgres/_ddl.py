@@ -375,7 +375,7 @@ WHEN ((NEW.active = 1 OR NEW.compacted = 1) IS DISTINCT FROM (OLD.active = 1 OR 
 EXECUTE FUNCTION messages_display_visibility_update()""",
     """CREATE OR REPLACE FUNCTION messages_display_visibility_update() RETURNS trigger AS $$
 BEGIN
-    UPDATE messages SET display_order = MIN(NEW.id, COALESCE((
+    UPDATE messages SET display_order = LEAST(NEW.id, COALESCE((
         SELECT display_order FROM messages
         WHERE session_id = NEW.session_id AND id <> NEW.id
           AND (active = 1 OR compacted = 1)

@@ -198,7 +198,7 @@ def resolve_and_repair_transcript_batch(
                 (encode_content_fn(msg.get("content")), target_id, session_id)) \
                 if target_row["content"] is None else \
                 conn.execute(
-                    "UPDATE messages SET content = %s WHERE id = %s AND session_id = %s AND content IS %s",
+                    "UPDATE messages SET content = %s WHERE id = %s AND session_id = %s AND content IS NOT DISTINCT FROM %s",
                     (encode_content_fn(msg.get("content")), target_id, session_id, target_row["content"]))
             wrote = written.rowcount > 0
         else:
@@ -251,7 +251,7 @@ def _rewrite_row(conn, session_id: str, target_row: Mapping[str, Any], serialize
     conn.execute(
         f"UPDATE messages SET {assignments}, display_metadata = "
         f"CASE WHEN display_metadata IS NOT NULL AND (display_metadata::jsonb -> '{TYPED_ASK}') IS NOT NULL "
-        f"AND convert_to(content, 'UTF8') IS NOT %s AND (%s::jsonb -> '{TYPED_ASK}') IS NULL "
+        f"AND content IS DISTINCT FROM %s AND (COALESCE(%s, '{{}}')::jsonb -> '{TYPED_ASK}') IS NULL "
         f"THEN (display_metadata::jsonb - '{TYPED_ASK}')::text ELSE display_metadata END "
         f"WHERE id = %s AND session_id = %s",
         [*(serialized[column] for column in _OWNED_COLUMNS), serialized["content"],
@@ -299,7 +299,7 @@ def _restore_display_index(conn, session_id, target_row, serialized, old_identit
 
 def _active_message_row(conn, session_id: str, row_id: int, role: str):
     """The same-role active clone for ``row_id``, or the addressed inactive row when no clone exists
-    (the SQLite ``_active_message_row`` port: payload predicates over the BYTEA columns use ``IS``)."""
+    (the SQLite ``_active_message_row`` port: payload predicates over the BYTEA columns use ``IS NOT DISTINCT FROM``)."""
     row = conn.execute(
         "SELECT * FROM messages WHERE id = %s AND session_id = %s", (row_id, session_id)
     ).fetchone()
@@ -316,10 +316,10 @@ def _active_message_row(conn, session_id: str, row_id: int, role: str):
         if value is None:
             predicates.append(f"{column} IS NULL")
         elif isinstance(value, (bytes, bytearray, memoryview)):
-            predicates.append(f"{column} IS %s")
+            predicates.append(f"{column} IS NOT DISTINCT FROM %s")
             params.append(bytes(value))
         else:
-            predicates.append(f"{column} IS %s")
+            predicates.append(f"{column} IS NOT DISTINCT FROM %s")
             params.append(value)
     payload_predicates = " AND ".join(predicates)
     clones = conn.execute(

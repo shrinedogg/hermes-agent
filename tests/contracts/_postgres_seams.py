@@ -25,11 +25,12 @@ from datetime import datetime
 from typing import Any, Mapping, Optional, Sequence
 
 import psycopg.rows
-from persistence import ProfileScope, RowVisibility, SessionId
+from persistence import PersistenceError, ProfileScope, RowVisibility, SessionId
 from persistence.core.canonical import canonical_json
 from persistence.conversation.messages import NewMessage
 from persistence.conversation.sessions import NewSession
 from persistence.postgres import PostgresBackend, PostgresStore
+from persistence.postgres._backend import _dsn, schema_for_home
 from tests.contracts._scopes import CONTRACT_ROOT
 
 
@@ -251,6 +252,7 @@ class ContractPostgresBackend(PostgresBackend):
     def __init__(self, stores: Mapping[str, Any], *, root: Optional[Any] = None) -> None:
         super().__init__(stores)
         self.root = root
+        self._opened_scopes: list[ProfileScope] = []
 
     def open(self, scope: ProfileScope) -> PostgresStore:
         # PostgresBackend has no public hook to serve one more profile, so this fixture class, and nothing
@@ -259,7 +261,24 @@ class ContractPostgresBackend(PostgresBackend):
             self._stores[scope.hermes_home_key] = self.root / "profiles" / scope.name / "state.db" \
                 if self.root else scope.hermes_home_key
         store = super().open(scope)
+        self._opened_scopes.append(scope)
         return _attach_seams(store)
+
+    def close(self) -> None:
+        """The base close drops only the schemas this backend created; a schema left by a killed run (or
+        another process) pre-existed it and would otherwise outlive the fixture - its rows would seed the
+        next backend's store. Drop every served scope's schema, best effort, after the base close has
+        released the handles."""
+        super().close()
+        for scope in self._opened_scopes:
+            schema = schema_for_home(scope, self.schema_override)
+            if schema in self._created_schemas:
+                continue  # the base close already dropped it
+            try:
+                with psycopg.connect(_dsn(), autocommit=True, connect_timeout=5) as conn:
+                    conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            except PersistenceError:
+                pass  # a dead server leaves the schema for the next run; the base close did its part
 
     def owner_profile_name_of(self, scope: ProfileScope) -> Optional[str]:
         return self.open(scope).owner_profile_name
