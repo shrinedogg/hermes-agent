@@ -735,7 +735,7 @@ def _local_conversations(conn):
     """``(members, derived)``: member id -> every id of its local conversation, and the ids of every
     derived (Bot Chat, A2A) conversation (the SQLite ``_local_conversations``)."""
     members, derived = {}, set()
-    rows = conn.execute("SELECT value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '*',)).fetchall()
+    rows = conn.execute("SELECT value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '%',)).fetchall()
     for (raw,) in [(r['value'],) for r in rows]:
         try:
             receipt = json.loads(raw)
@@ -826,10 +826,10 @@ def _retire_local_receipts(conn, session_ids) -> None:
     if not targets:
         return
     gone = [row['key'] for row in conn.execute(
-        "SELECT key, value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '*',)).fetchall()
+        "SELECT key, value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '%',)).fetchall()
         if _policy_target(row['value']) in targets]
     gone += [row['key'] for row in conn.execute(
-        "SELECT key, value FROM state_meta WHERE key LIKE %s", (API_DECLARED_PREFIX + '*',)).fetchall()
+        "SELECT key, value FROM state_meta WHERE key LIKE %s", (API_DECLARED_PREFIX + '%',)).fetchall()
         if row['value'] in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]
     for key in gone:
@@ -885,7 +885,7 @@ def _local_lineage_index(conn):
     superseded, heads = set(), {}
     rows = conn.execute(
         "SELECT value FROM state_meta WHERE key LIKE %s AND hermes_json_valid(value)"
-        " AND jsonb_array_length(value::jsonb -> 'lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()
+        " AND jsonb_array_length(value::jsonb -> 'lineage') > 1", (POLICY_PREFIX + '%',)).fetchall()
     for row in rows:
         receipt = json.loads(row['value'])
         owner, lineage = receipt.get('session_id'), receipt.get('lineage')
@@ -1031,7 +1031,7 @@ def _set_session_title_in_transaction(conn, session_id: str, title, *, source: s
                              "identity, and renaming it would orphan the conversation. "
                              "To start fresh, create a new bot instead.")
         return []
-    if not is_user and current["title"] is not None and _title_rank(current["title_source"] or "") >= new_rank:
+    if not is_user and current["title"] is not None and _title_rank(current["title_source"]) >= new_rank:
         return []
     if title:
         cleared = _resolve_title_conflict(conn, session_id, title)
@@ -1771,6 +1771,13 @@ def list_sessions_rich(
 ) -> list:
     """List sessions with preview and ``last_active`` in one query (the SQLite
     ``list_sessions_rich``; the chain walk is depth-capped, so a corrupt cycle cannot loop forever)."""
+    # An uninitialised store reads empty, as an absent SQLite file does (a read never creates the
+    # schema): answer [] before any statement touches a table this store has not had yet.
+    if store.one(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = current_schema() AND table_name = 'sessions'"
+    ) is None:
+        return []
     where_clauses, params = _session_filter_where(
         exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
         exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
@@ -2160,26 +2167,14 @@ def declared_scope_identity(store: "PostgresStore", session_id: str) -> tuple:
 def is_kanban_owned_session(store: "PostgresStore", session_id: str) -> bool:
     """True when the verified compression lineage a resume would materialize is Kanban-owned (the
     SQLite ``is_kanban_owned_session``): any segment with ``source``/``created_source`` = 'kanban'."""
-    conn = store.connection()
-    lineage = [session_id]
-    seen = set(lineage)
-    current = session_id
-    for _ in range(_CHAIN_CAP):
-        row = conn.execute("SELECT parent_session_id, end_reason FROM sessions WHERE id = %s",
-                           (current,)).fetchone()
-        if row is None or not row["parent_session_id"] or row["parent_session_id"] in seen:
-            break
-        if row["end_reason"] != "compression":
-            break
-        seen.add(row["parent_session_id"])
-        lineage.append(row["parent_session_id"])
-        current = row["parent_session_id"]
+    from persistence.postgres.conversation._store.reads import _resume_lineage_ids
+    lineage = _resume_lineage_ids(store, session_id)
     if not lineage:
         return False
     ph = ",".join(" %s" for _ in lineage)
-    row = conn.execute(
+    row = store.one(
         f"SELECT 1 FROM sessions WHERE id IN ({ph}) AND (source = 'kanban' OR created_source = 'kanban') "
-        "LIMIT 1", lineage).fetchone()
+        "LIMIT 1", *lineage)
     return row is not None
 
 
@@ -2187,7 +2182,8 @@ def is_kanban_owned_session(store: "PostgresStore", session_id: str) -> bool:
 
 _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
 _DISPLAY_VISIBLE_SQL = (
-    f" AND COALESCE({_json_key('display_metadata', MODEL_ONLY_DISPLAY_METADATA_KEY)}, 0) = 0")
+    f" AND COALESCE({_json_key('display_metadata', MODEL_ONLY_DISPLAY_METADATA_KEY)}, 'false')"
+    " NOT IN ('true', '1')")
 _NOT_A_LATER_TOOL_COPY_SQL = (
     " AND NOT (messages.role = 'tool' AND messages.message_uid IS NOT NULL AND EXISTS ("
     "SELECT 1 FROM messages AS original WHERE original.session_id = messages.session_id"
@@ -2286,9 +2282,14 @@ def _expand_compression_lineage(conn, session_ids: list) -> list:
     for _ in range(_CHAIN_CAP):
         if not frontier:
             break
-        up = [row["parent_session_id"] for row in conn.execute(
-            "SELECT parent_session_id FROM sessions WHERE id = ANY(%s) AND end_reason = 'compression'",
-            (frontier,)).fetchall() if row["parent_session_id"]]
+        up = [row["parent_id"] for row in conn.execute(
+            "SELECT parent.id AS parent_id FROM sessions child "
+            "JOIN sessions parent ON parent.id = child.parent_session_id "
+            "WHERE child.id = ANY(%s) AND parent.end_reason = 'compression' "
+            f"AND {_json_key_text('child.model_config', '_branched_from')} IS NULL "
+            f"AND {_json_key_text('child.model_config', '_delegate_from')} IS NULL "
+            f"AND NOT ({_RESET_CHILD_SQL.format(a='child')}) AND COALESCE(child.source, '') <> 'tool'",
+            (frontier,)).fetchall() if row["parent_id"] is not None]
         down = [row["id"] for row in conn.execute(
             f"SELECT child.id FROM sessions parent JOIN sessions child ON child.parent_session_id = parent.id "
             "WHERE parent.id = ANY(%s) AND parent.end_reason = 'compression' "

@@ -270,6 +270,22 @@ STATEMENTS: tuple[str, ...] = (
     updated_at DOUBLE PRECISION NOT NULL,
     expires_at DOUBLE PRECISION
 )""",
+    """CREATE TABLE IF NOT EXISTS delivery_obligations (
+    obligation_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    content TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','attempting','failed','delivered','abandoned')),
+    attempts BIGINT NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    owner_pid BIGINT,
+    owner_started_at BIGINT,
+    last_error TEXT,
+    adapter_profile TEXT
+)""",
     # ── indexes (mirrors the SCHEMA_SQL + DEFERRED_INDEX_SQL index set; FTS bookkeeping excluded) ──
     "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id)",

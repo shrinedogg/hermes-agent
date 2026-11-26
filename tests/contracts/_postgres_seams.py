@@ -276,7 +276,16 @@ class ContractPostgresBackend(PostgresBackend):
         # PostgresBackend has no public hook to serve one more profile, so this fixture class, and nothing
         # else in the suite, registers the store location in its private map.
         if scope.hermes_home_key not in self._stores:
-            self._stores[scope.hermes_home_key] = self.root / "profiles" / scope.name / "state.db" \
+            from pathlib import Path
+            from tests.contracts._scopes import CONTRACT_ROOT
+            try:
+                # Mirror the scope's place in the suites' fake root under the fixture root: the owner
+                # derivation (profile tree or not) then answers from the location, as the reference
+                # derives it from the store's own path.
+                rel = Path(scope.profile_dir).relative_to(CONTRACT_ROOT)
+            except ValueError:  # a scope home outside the suites' root keeps its own name
+                rel = Path(scope.name)
+            self._stores[scope.hermes_home_key] = self.root / rel / "state.db" \
                 if self.root else scope.hermes_home_key
         store = super().open(scope)
         self._opened_scopes.append(scope)

@@ -292,7 +292,7 @@ def _local_conversations(conn):
     Malformed receipts name nothing."""
     members, derived = {}, set()
     for (raw,) in [(row["value"],) for row in conn.execute(
-            "SELECT value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + "*",)).fetchall()]:
+            "SELECT value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + "%",)).fetchall()]:
         try:
             receipt = json.loads(raw)
         except (TypeError, ValueError):
@@ -391,7 +391,7 @@ def _retire_mutation_receipts(conn, session_ids) -> None:
         return
     targets = set(session_ids)
     for row in conn.execute(
-            "SELECT key, value FROM state_meta WHERE key LIKE 'gateway.mutation.v1.*'").fetchall():
+            "SELECT key, value FROM state_meta WHERE key LIKE 'gateway.mutation.v1.%'").fetchall():
         try:
             receipt = json.loads(row["value"])
         except (TypeError, ValueError):
@@ -441,10 +441,10 @@ def _retire_local_receipts(conn, session_ids) -> None:
     if not targets:
         return
     gone = [row["key"] for row in conn.execute(
-        "SELECT key, value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '*',))
+        "SELECT key, value FROM state_meta WHERE key LIKE %s", (POLICY_PREFIX + '%',))
         if _policy_target(row["value"]) in targets]
     gone += [row["key"] for row in conn.execute(
-        "SELECT key, value FROM state_meta WHERE key LIKE %s", (API_DECLARED_PREFIX + '*',))
+        "SELECT key, value FROM state_meta WHERE key LIKE %s", (API_DECLARED_PREFIX + '%',))
         if row["value"] in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]
     for key in gone:
@@ -488,7 +488,7 @@ def _reclaim_expired(conn, prefix: str, cutoff: float) -> None:
     conn.execute(
         "DELETE FROM state_meta WHERE key LIKE %s AND json_text_valid(value) "
         "AND json_text_field_number(value, 'retired_at') < %s AND value::jsonb ? 'expires'",
-        (prefix + '*', cutoff))
+        (prefix + '%', cutoff))
 
 
 def _prune_retired_tombstones(conn, older_than: float = RETRY_HORIZON_S) -> None:
@@ -503,12 +503,12 @@ def _prune_retired_tombstones(conn, older_than: float = RETRY_HORIZON_S) -> None
             "UPDATE state_meta SET value = (jsonb_set(value::jsonb, '{retired_at}', "
             "to_jsonb(%s::float8)))::text WHERE key LIKE %s AND json_text_valid(value) "
             "AND json_text_field_number(value, 'retired_at') IS NULL",
-            (now, prefix + '*'))
+            (now, prefix + '%'))
     cutoff = now - older_than
     for row in conn.execute(
             "SELECT key, value FROM state_meta WHERE key LIKE %s AND json_text_valid(value) "
             "AND json_text_field_number(value, 'retired_at') < %s",
-            (ADMISSION_PREFIX + '*', cutoff)).fetchall():
+            (ADMISSION_PREFIX + '%', cutoff)).fetchall():
         rec = json.loads(row["value"])
         conn.execute("DELETE FROM state_meta WHERE key IN (%s, %s, %s)",
                      (row["key"], RESULT_PREFIX + rec['admission_id'],
@@ -516,7 +516,7 @@ def _prune_retired_tombstones(conn, older_than: float = RETRY_HORIZON_S) -> None
     conn.execute(
         "DELETE FROM state_meta WHERE key LIKE %s AND json_text_valid(value) "
         "AND json_text_field_number(value, 'retired_at') < %s",
-        (WORKER_PREFIX + '*', cutoff))
+        (WORKER_PREFIX + '%', cutoff))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
         _reclaim_expired(conn, prefix, cutoff)
 

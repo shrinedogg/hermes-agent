@@ -44,7 +44,7 @@ from persistence.sqlite.conversation._store.core import _CONTENT_JSON_PREFIX
 from persistence.sqlite.conversation._store.rules import (
     ABSORBED_ROW_IDS, DB_ROW_SNAPSHOT, RESTORED_FROM_STORE,
 )
-from session_rules.turns import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
+from session_rules.turns import MERGED_DURABLE_ROWS, OWN_ROW, RETIRED_DURABLE_ROWS, RETIRED_ROW, UNNAMED_DURABLE_ROWS
 
 from .._backend import PostgresStore, refusals, register_repository
 from .._stubs import add_stubs
@@ -208,9 +208,9 @@ def _held_dict(held: HeldMessage) -> dict[str, Any]:
     if held.tool_call_ids:
         msg["tool_call_ids"] = list(held.tool_call_ids)
     if held.own_row:
-        msg["own_row"] = True
+        msg[OWN_ROW] = True
     if held.retired_row:
-        msg["retired_row"] = True
+        msg[RETIRED_ROW] = True
     return msg
 
 

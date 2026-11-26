@@ -10,15 +10,17 @@ SQLite repository module; the SQL is this module's own.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Mapping, Optional
 
-from persistence import SessionId
+from persistence import AuthorityRefusal, SessionId
 from persistence.conversation.usage import (
     AuxiliaryTaskUsage, BillingRoute, PromptCacheClockRecord, RouteUsage, TokenCounts, UsageDelta,
     UsageRepository, UsageTotals, UsageTotalsQuery,
 )
 from persistence.conversation.usage import UsageAnalytics
+from persistence.sqlite.conversation._store.retirement import RETIRED_PREFIX
 from persistence.sqlite.conversation.usage import _delta_kwargs
 from psycopg import errors as pg_errors
 
@@ -27,6 +29,8 @@ from .._lineage_common import json_marker_absent_sql, session_lineage_root_to_ti
 from .._stubs import add_stubs
 
 __all__ = ["PgUsageRepository"]
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
 _MODEL_USAGE_FIELDS = frozenset((
@@ -250,9 +254,14 @@ class PgUsageRepository:
 
     def queue_usage(self, session_id: SessionId, delta: UsageDelta) -> None:
         """Apply one usage delta (the SQLite queue's item); the PG store applies it straight through
-        the counters transaction - no background writer to queue for."""
+        the counters transaction - no background writer to queue for. A failed apply is logged at
+        WARNING and dropped, never raised into the caller (the SQLite queue's failure contract: a
+        delta beside a session's deletion tombstone is the standing case)."""
         kwargs = _delta_kwargs(delta)
-        self._update_token_counts(str(session_id), absolute=False, **kwargs)
+        try:
+            self._update_token_counts(str(session_id), absolute=False, **kwargs)
+        except Exception as exc:  # health: allow BLE001 -- accounting loss is logged, never raised into a turn
+            logger.warning("async token accounting: apply failed (session=%s): %s", session_id, exc)
 
     def flush_usage(self, timeout: float = 5.0) -> bool:
         """The read barrier: nothing is queued on the PG store, so the barrier is already met."""
@@ -265,16 +274,27 @@ class PgUsageRepository:
         source = values.pop("source", None)
         with translated():
             with store.tx() as conn:
+                # A delayed accounting backfill must not recreate a deleted session beside its durable
+                # tombstone (the SQLite ``insert_session_row`` guard): the apply fails and the queue's
+                # failure path logs and drops the delta.
+                if conn.execute("SELECT 1 FROM sessions WHERE id = %s", (session_id,)).fetchone() is None \
+                        and conn.execute(
+                            "SELECT 1 FROM state_meta WHERE key = %s",
+                            (RETIRED_PREFIX + session_id,)).fetchone():
+                    raise AuthorityRefusal("not_found")
                 # Ensure the row exists: the UPDATE would otherwise silently affect 0 rows when the
                 # creator's insert raced; the first backfill carries the real source, and a later
                 # real source replaces the token-accounting guard's ``unknown`` placeholder
-                # (the reference upsert's #111999 rule) - every other surface is kept.
+                # (the reference upsert's #111999 rule) - every other surface is kept. A routed delta
+                # projects its model onto an unset session model (the reference upsert's
+                # ``model = COALESCE(sessions.model, excluded.model)``).
                 conn.execute(
                     "INSERT INTO sessions (id, source, created_source, started_at, model) "
                     "VALUES (%s, %s, %s, %s, %s) "
                     "ON CONFLICT (id) DO UPDATE SET "
                     "source = CASE WHEN sessions.source = 'unknown' "
-                    "THEN COALESCE(EXCLUDED.source, 'unknown') ELSE sessions.source END",
+                    "THEN COALESCE(EXCLUDED.source, 'unknown') ELSE sessions.source END, "
+                    "model = COALESCE(sessions.model, EXCLUDED.model)",
                     (session_id, source or "unknown", source or "unknown", time.time(), values.get("model")))
                 self._update_token_counts_in_transaction(conn, session_id, absolute=absolute, **values)
 
