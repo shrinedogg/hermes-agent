@@ -31,6 +31,7 @@ from persistence.housekeeping.maintenance import (
     PruneReclaimEstimate, PruneResult, SessionExport, SessionExportRow, SessionLineageExport,
     SessionMaintenance, TreeServeFacts,
 )
+from process_identity import holder_process_is_dead
 from session_rules.session_ids import new_session_id
 from utils import safe_json_loads
 from psycopg import errors as pg_errors
@@ -526,11 +527,40 @@ def _write_guards_reject(conn, sid: str) -> bool:
     """True when a live turn lease or compression lock protects ``sid`` (the SQLite
     ``_write_guards_reject`` read-only shape: the guards' own reclamation lives in the
     transcript writers, which this store's prune path never calls)."""
+    # The same clock domain the lease expiries were computed in (the store's ``time.time()``),
+    # never the server's ``now()``: a guard is live iff its stored expiry outruns the store's now.
+    now = time.time()
     row = conn.execute(
-        "SELECT 1 FROM session_turn_leases WHERE conversation_id = %s AND expires_at > EXTRACT(EPOCH FROM now()) "
+        "SELECT 1 FROM session_turn_leases WHERE conversation_id = %s AND expires_at > %s "
         "UNION ALL SELECT 1 FROM compression_locks WHERE session_id = %s "
-        "AND expires_at > EXTRACT(EPOCH FROM now()) LIMIT 1", (sid, sid)).fetchone()
+        "AND expires_at > %s LIMIT 1", (sid, now, sid, now)).fetchone()
     return row is not None
+
+
+def _sweep_guards_reject(conn, sid: str, now: float) -> bool:
+    """The sweep's guard check in the SQLite reference's reclaiming shape: a stale guard (expired, or a
+    provably dead local holder) is deleted as a side effect, so the holder's later refresh finds no row.
+    A live compression lock stops the check before the turn lease, leaving a stale turn lease behind it
+    alone. The prune path's read-only check is ``_write_guards_reject``."""
+    lock = conn.execute(
+        "SELECT holder, expires_at FROM compression_locks WHERE session_id = %s", (sid,)).fetchone()
+    if lock is not None:
+        if float(lock["expires_at"]) <= now or holder_process_is_dead(str(lock["holder"])):
+            conn.execute(
+                "DELETE FROM compression_locks WHERE session_id = %s AND holder = %s",
+                (sid, lock["holder"]))
+        else:
+            return True
+    lease = conn.execute(
+        "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = %s", (sid,)).fetchone()
+    if lease is not None:
+        if float(lease["expires_at"]) <= now or holder_process_is_dead(str(lease["holder"])):
+            conn.execute(
+                "DELETE FROM session_turn_leases WHERE conversation_id = %s AND holder = %s",
+                (sid, lease["holder"]))
+        else:
+            return True
+    return False
 
 
 # ── the import payload validation (the SQLite ``_portability`` module functions, pure Python) ──
@@ -973,7 +1003,7 @@ class PgSessionMaintenance:
                                 scope_params).fetchall()
             excluded = {str(x) for x in exclude_ids if x}
             victims = [sid for sid in (row["id"] for row in rows)
-                       if sid not in excluded and not _write_guards_reject(conn, sid)]
+                       if sid not in excluded and not _sweep_guards_reject(conn, sid, now)]
             if not victims:
                 return []
             # Re-apply every predicate under the write lock; a concurrent sweep that committed first

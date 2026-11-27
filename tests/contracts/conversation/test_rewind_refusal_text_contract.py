@@ -36,7 +36,15 @@ def _seed(backend, scope, first_ask: Any = "u1"):
 
 def _interpose_plan_reads(backend_name: str, repo, monkeypatch, edit: Callable[[list, bool], list]) -> None:
     """Route the rewind plan's two durable reads through ``edit(rows, repaired)``."""
-    if backend_name == "sqlite":
+    if backend_name == "in_memory":
+        # The reference plan's durable reads are the repository's own ``_durable``; interpose on the instance.
+        real = repo._durable
+
+        def read(scope, sid, **kwargs):
+            return edit(real(scope, sid, **kwargs), bool(kwargs.get("repair")))
+
+        monkeypatch.setattr(repo, "_durable", read)
+    elif backend_name == "sqlite":
         from persistence.sqlite.conversation._store import rewind as module
 
         real = module.get_messages_as_conversation
@@ -130,7 +138,10 @@ def test_a_carrier_rewind_without_its_handoff_carries_the_handoff_text(backend_n
     repo.append(S, NewMessage(role="assistant", content="older reply", timestamp=ts(1)))
     repo.append(S, NewMessage(role="user", content=composite_carrier("old task", "REAL ASK"), timestamp=ts(2)))
     repo.append(S, NewMessage(role="assistant", content="failed", timestamp=ts(3)))
-    if backend_name == "sqlite":
+    if backend_name == "in_memory":
+        # The reference's pinned write is the repository's ``_rewind_to``: a lost scaffold is the dead handoff.
+        monkeypatch.setattr(repo, "_rewind_to", lambda scope, sid, plan: (0, None))
+    elif backend_name == "sqlite":
         from persistence.sqlite.conversation._store import rewind as module
 
         real = module.rewind_to_message
