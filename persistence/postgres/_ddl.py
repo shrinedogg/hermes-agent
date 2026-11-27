@@ -535,6 +535,323 @@ BEGIN
       AND display_identity = OLD.display_identity;
     RETURN NULL;
 END; $$ LANGUAGE plpgsql""",
+    # ── hosted rooms (stage 4): the SQLite hosted files' tables, one schema each ──
+    # The room tables of the profile and shared placements (the reference's shared-state.db step);
+    # the JSON columns are plain text as stored (``hermes_json_valid`` guards every jsonb read).
+    """CREATE TABLE IF NOT EXISTS hosted_rooms (
+    room_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    members_json TEXT NOT NULL,
+    authority_gateway_id TEXT NOT NULL,
+    authority_epoch BIGINT NOT NULL DEFAULT 1 CHECK (authority_epoch >= 1),
+    next_seq BIGINT NOT NULL DEFAULT 1 CHECK (next_seq >= 1),
+    event_bytes BIGINT NOT NULL DEFAULT 0 CHECK (event_bytes >= 0),
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    disbanded_at DOUBLE PRECISION
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_events (
+    room_id TEXT NOT NULL,
+    seq BIGINT NOT NULL CHECK (seq >= 1),
+    event_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    authority_epoch BIGINT CHECK (authority_epoch IS NULL OR authority_epoch >= 1),
+    payload_json TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (room_id, seq),
+    UNIQUE (room_id, event_id),
+    FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_retired_ids (
+    room_id TEXT PRIMARY KEY,
+    retired_at DOUBLE PRECISION NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_links (
+    room_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    "grant" TEXT NOT NULL,
+    catalog_json TEXT NOT NULL,
+    cancellation_scope_id TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    transport_security TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready',
+    updated_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (room_id, member_id)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_remote_runs (
+    room_id TEXT NOT NULL,
+    home_install_id TEXT NOT NULL,
+    authority_gateway_id TEXT NOT NULL,
+    authority_epoch BIGINT NOT NULL CHECK (authority_epoch >= 1),
+    member_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    execution_generation BIGINT NOT NULL CHECK (execution_generation >= 1),
+    target_install_id TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (
+        room_id, home_install_id, authority_gateway_id, authority_epoch,
+        member_id, target_install_id, target_profile, task_id,
+        execution_generation)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_revoked_grants (
+    scope_key TEXT PRIMARY KEY,
+    expires_at DOUBLE PRECISION NOT NULL,
+    revoked_before DOUBLE PRECISION NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_peer_reservations (
+    room_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    target_profile TEXT NOT NULL,
+    authority_gateway_id TEXT NOT NULL,
+    authority_epoch BIGINT NOT NULL CHECK (authority_epoch >= 1),
+    expires_at DOUBLE PRECISION NOT NULL,
+    revoked_at DOUBLE PRECISION,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (room_id, member_id, target_profile)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_owed_revokes (
+    room_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    grant_digest TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    "grant" TEXT NOT NULL,
+    expires_at DOUBLE PRECISION NOT NULL,
+    attempts BIGINT NOT NULL DEFAULT 0,
+    next_attempt_at DOUBLE PRECISION NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    held BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (room_id, member_id, grant_digest)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_events_cursor ON hosted_room_events (room_id, seq)""",
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_events_kind ON hosted_room_events (room_id, kind, seq)""",
+    # The room driver (the reference's driver step).
+    """CREATE TABLE IF NOT EXISTS hosted_room_driver_leases (
+    room_id TEXT PRIMARY KEY,
+    gateway_id TEXT NOT NULL,
+    authority_epoch BIGINT NOT NULL CHECK (authority_epoch >= 1),
+    process_generation TEXT NOT NULL,
+    lease_generation BIGINT NOT NULL CHECK (lease_generation >= 1),
+    expires_at DOUBLE PRECISION NOT NULL,
+    acquired_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    released_at DOUBLE PRECISION,
+    FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_driver_tasks (
+    room_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    source_event_seq BIGINT NOT NULL CHECK (source_event_seq >= 1),
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'queued', 'running', 'settled', 'failed', 'cancelled',
+        'indeterminate', 'deferred', 'stopping')),
+    execution_generation BIGINT NOT NULL DEFAULT 0 CHECK (execution_generation >= 0),
+    cancel_generation BIGINT NOT NULL DEFAULT 0 CHECK (cancel_generation >= 0),
+    run_gateway_id TEXT,
+    run_process_generation TEXT,
+    run_lease_generation BIGINT,
+    cancel_id TEXT,
+    settlement_id TEXT,
+    settlement_status TEXT,
+    result_json TEXT,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    started_at DOUBLE PRECISION,
+    terminal_at DOUBLE PRECISION,
+    indeterminate_at DOUBLE PRECISION,
+    PRIMARY KEY (room_id, task_id),
+    UNIQUE (room_id, thread_id, turn_id),
+    FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_driver_tasks_status
+       ON hosted_room_driver_tasks (room_id, status, source_event_seq, created_at, task_id)""",
+    # The policy checkpoint (the reference's policy step).
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_capacity (
+    singleton BIGINT PRIMARY KEY CHECK (singleton = 1),
+    max_active_events BIGINT NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_cursors (
+    room_id TEXT PRIMARY KEY,
+    through_seq BIGINT NOT NULL DEFAULT 0,
+    stopped_through_seq BIGINT NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_threads (
+    room_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    discussion_event_id TEXT NOT NULL,
+    latest_user_seq BIGINT NOT NULL,
+    completed BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (room_id, thread_id)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_policy_pending
+       ON hosted_room_policy_threads (room_id, completed, latest_user_seq, thread_id)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_events (
+    room_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    discussion_event_id TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    event_json TEXT NOT NULL,
+    PRIMARY KEY (room_id, seq)
+)""",
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_policy_events_active
+       ON hosted_room_policy_events (room_id, discussion_event_id, seq)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_watermarks (
+    room_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    seen_through_seq BIGINT NOT NULL,
+    PRIMARY KEY (room_id, thread_id, member_id)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_publications (
+    room_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    execution_generation BIGINT NOT NULL DEFAULT 0,
+    seq BIGINT NOT NULL,
+    PRIMARY KEY (room_id, task_id, kind, execution_generation)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_transcript (
+    room_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    settled_seq BIGINT,
+    PRIMARY KEY (room_id, thread_id, seq)
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_policy_transcript_state (
+    room_id TEXT PRIMARY KEY,
+    schema_version BIGINT NOT NULL
+)""",
+    # The reference's user-thread index over the room log; the thread id sits in the payload JSON,
+    # read through the ``hermes_json_valid`` guard (the SQLite ``json_extract`` twin).
+    """CREATE INDEX IF NOT EXISTS idx_hosted_room_user_thread
+       ON hosted_room_events (room_id,
+          (CASE WHEN hermes_json_valid(payload_json) THEN payload_json::jsonb ->> 'thread_id' END),
+          seq)
+       WHERE kind = 'message.user'""",
+    # The replicated logs (the reference's replica step).
+    """CREATE TABLE IF NOT EXISTS hosted_room_replicas (
+    room_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    members_json TEXT NOT NULL,
+    authority_gateway_id TEXT NOT NULL,
+    authority_epoch BIGINT NOT NULL CHECK (authority_epoch >= 1),
+    last_seq BIGINT NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+    latest_seq BIGINT NOT NULL DEFAULT 0,
+    event_bytes BIGINT NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_replica_events (
+    room_id TEXT NOT NULL,
+    seq BIGINT NOT NULL CHECK (seq >= 1),
+    event_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    authority_epoch BIGINT,
+    payload_json TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (room_id, seq)
+)""",
+    # The attachment rows and blobs (the blobs themselves are files beside the store, not rows).
+    """CREATE TABLE IF NOT EXISTS hosted_room_attachment_blobs (
+    blob_id TEXT PRIMARY KEY,
+    sha256 TEXT NOT NULL UNIQUE,
+    size BIGINT NOT NULL CHECK (size > 0),
+    ref_count BIGINT NOT NULL CHECK (ref_count > 0),
+    created_at DOUBLE PRECISION NOT NULL
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_attachments (
+    attachment_id TEXT PRIMARY KEY,
+    upload_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    event_id TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size BIGINT NOT NULL CHECK (size > 0),
+    mime TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    blob_id TEXT NOT NULL,
+    recipient_member_ids_json TEXT NOT NULL DEFAULT '[]',
+    viewer_access BIGINT NOT NULL DEFAULT 0 CHECK (viewer_access IN (0, 1)),
+    state TEXT NOT NULL CHECK (state IN ('uploaded', 'committed', 'disbanded')),
+    created_at DOUBLE PRECISION NOT NULL,
+    updated_at DOUBLE PRECISION NOT NULL,
+    expires_at DOUBLE PRECISION,
+    UNIQUE (room_id, upload_id),
+    FOREIGN KEY (blob_id) REFERENCES hosted_room_attachment_blobs(blob_id)
+)""",
+    # The driver work-record tables (the reference's work-record capture; the guards the SQLite
+    # triggers install run as explicit checks on the capture's write paths).
+    # The reference's work-record authority-transition trigger: a raw authority move of the room
+    # freezes the old owner's current evidence (source rows to ``historical``, pending rows to
+    # ``superseded_authority`` unless acked, whose delivery outcome outlives the move).
+    """CREATE OR REPLACE FUNCTION hosted_room_work_authority_transition() RETURNS trigger AS $$
+BEGIN
+    UPDATE hosted_room_work_records_source
+       SET disposition = 'historical'
+     WHERE room_id = NEW.room_id AND disposition = 'current'
+       AND (producer_gateway_id <> NEW.authority_gateway_id OR producer_epoch <> NEW.authority_epoch);
+    UPDATE hosted_room_work_records_pending
+       SET disposition = CASE WHEN status = 'acked' THEN 'historical' ELSE 'superseded_authority' END
+     WHERE room_id = NEW.room_id AND disposition = 'current'
+       AND (producer_gateway_id <> NEW.authority_gateway_id OR producer_epoch <> NEW.authority_epoch);
+    RETURN NEW;
+END; $$ LANGUAGE plpgsql""",
+    """DROP TRIGGER IF EXISTS hosted_room_work_authority_transition ON hosted_rooms
+CREATE TRIGGER hosted_room_work_authority_transition
+       AFTER UPDATE OF authority_gateway_id, authority_epoch ON hosted_rooms
+       FOR EACH ROW EXECUTE FUNCTION hosted_room_work_authority_transition()""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_work_records_source (
+    room_id TEXT NOT NULL,
+    revision BIGINT NOT NULL,
+    digest TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    producer_gateway_id TEXT NOT NULL,
+    producer_epoch BIGINT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('current', 'superseded_authority', 'historical', 'invalid')),
+    PRIMARY KEY (room_id, producer_gateway_id, producer_epoch),
+    FOREIGN KEY (room_id) REFERENCES hosted_rooms(room_id) ON DELETE CASCADE
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_work_records_pending (
+    room_id TEXT NOT NULL,
+    revision BIGINT NOT NULL,
+    digest TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    producer_gateway_id TEXT NOT NULL,
+    producer_epoch BIGINT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('current', 'superseded_authority', 'historical', 'invalid')),
+    target_install_id TEXT NOT NULL,
+    route_generation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (room_id, producer_gateway_id, producer_epoch, target_install_id),
+    FOREIGN KEY (room_id) REFERENCES hosted_room_replicas(room_id) ON DELETE CASCADE
+)""",
+    """CREATE TABLE IF NOT EXISTS hosted_room_work_records_invalid (
+    evidence_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    source_table TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    revision BIGINT NOT NULL,
+    digest TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    target_install_id TEXT,
+    route_generation TEXT,
+    status TEXT,
+    disposition TEXT NOT NULL CHECK (disposition = 'invalid')
+)""",
 )
 
 

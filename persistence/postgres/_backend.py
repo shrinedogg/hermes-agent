@@ -381,6 +381,21 @@ def schema_for_home(scope: ProfileScope, override: Optional[str] = None, namespa
     return result
 
 
+def shared_schema_for(namespace: Optional[str] = None) -> str:
+    """The ONE fixed shared schema of one assembly (the install-wide shared-state.db place the hosted
+    rooms map onto: a per-profile schema could not be shared between the profiles of one install).
+    ``hermes_shared`` with the assembly's namespace suffix, so one assembly's shared store never
+    mixes with another assembly's; a fresh assembly's shared store starts empty, as its profiles' do."""
+    name = "hermes_shared"
+    if namespace:
+        suffix = re.sub(r"[^a-z0-9_]", "_", namespace.lower()).rstrip("_")
+        if suffix:
+            name = f"{name}_{suffix}"
+    name = name[:63]
+    _valid_schema_name(name)
+    return name
+
+
 # ── health (the corruption latch and the readiness probe) ─────────────────────
 
 _LATCHES: dict[tuple[str, str], StorageState] = {}
@@ -463,6 +478,10 @@ class PostgresBackend:
         self.read_patience_s = read_patience_s  # accepted, ignored (no file-lock patience on PostgreSQL)
         self.check_drift = check_drift  # accepted, ignored (declarative schema, no legacy drift)
         self._schema_namespace = schema_namespace
+        # The one fixed shared schema of this assembly (the install's shared-state.db place); created on
+        # first shared write and dropped with this backend's schemas.
+        self._shared_schema = shared_schema_for(schema_namespace)
+        self._shared_schema_created = False
         self.executor = _store_executor()
         self._lock = threading.Lock()
         self._schema_create_lock = threading.Lock()  # serialises the schema-create path per process
@@ -534,6 +553,8 @@ class PostgresBackend:
             for schema in self._schema_by_key.values():
                 if schema not in to_drop:
                     to_drop.append(schema)
+            if self._shared_schema_created and self._shared_schema not in to_drop:
+                to_drop.append(self._shared_schema)
         self._release_connections()
         for schema in to_drop:
             try:
@@ -651,6 +672,12 @@ class PostgresStore:
         # The lazy first checkout of ``self._conn`` (shared by the read and write doors) is
         # check-then-set: a plain lock keeps two threads from pinning two pool connections.
         self._conn_assign_lock = threading.Lock()
+        # The handle's second pair of connections, pinned to the backend's fixed shared schema (the
+        # install-wide shared-state.db place the hosted rooms' shared placement maps onto): a separate
+        # write door (``shared_connection``) and read door (``shared_read_conn``) from the store's own.
+        self._shared_conn: Optional[Connection] = None
+        self._shared_schema_ready = False
+        self._shared_conn_assign_lock = threading.Lock()
         self.aio = AwaitableStore(self)
         for attribute in CAPABILITY_ATTRIBUTES:
             factory = _REPOSITORY_FACTORIES.get(attribute)
@@ -767,6 +794,97 @@ class PostgresStore:
             self._schema_ready = True
         self._generation = self._backend._generation_for(self.schema)
 
+    @property
+    def shared_schema(self) -> str:
+        """The backend's fixed shared schema (the shared placement of the hosted rooms): one schema for
+        every profile this backend serves, so a profile's shared records reach every sibling profile."""
+        return self._backend._shared_schema
+
+    # ── shared schema (the install-wide place of the hosted rooms) ──
+
+    def _shared_checkout(self, conn) -> None:
+        """Pin a pooled connection to the shared schema (the store's ``_checkout`` twin on the shared side)."""
+        conn.row_factory = psycopg.rows.dict_row
+        if self.read_only:
+            conn.set_read_only(True)
+        conn.execute(f'SET search_path TO "{self.shared_schema}"')
+
+    def _shared_schema_exists(self, conn: Connection) -> bool:
+        return bool(conn.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (self.shared_schema,)
+        ).fetchone())
+
+    def shared_connection(self) -> Connection:
+        """The handle's shared write connection, checked out on first use and pinned to the shared schema;
+        a read-only handle whose shared schema was never written refuses (the reader never creates)."""
+        self._refuse_write()
+        if self._shared_conn is not None:
+            return self._shared_conn
+        with self._shared_conn_assign_lock:
+            if self._shared_conn is not None:
+                return self._shared_conn
+            self._backend._require_open()
+            dsn = _dsn()
+            with translated():
+                conn = _pool_for(dsn).getconn()
+                self._shared_checkout(conn)
+                if self.read_only and not self._shared_schema_exists(conn):
+                    # Hand the connection back to the pool (a closed connection is invisible to it and its
+                    # slot would stay counted against max_size forever), and refuse as the reference's
+                    # read-only shared reader does: the missing shared file is StoreUnavailable.
+                    conn.commit()
+                    _pool_for(dsn).putconn(conn)
+                    raise StoreUnavailable(f"postgres shared store {self.shared_schema!r} is not initialized")
+            self._shared_conn = conn
+            return conn
+
+    def ensure_shared_schema(self) -> None:
+        """Create the shared schema and its declarative DDL if it has never been written (writer only):
+        idempotent, one shot per handle, the shared twin of :meth:`ensure_schema`."""
+        if self.read_only:
+            return
+        if self._shared_schema_ready:
+            return
+        with self._backend._schema_create_lock:
+            if self._shared_schema_ready:
+                return
+            if not self._shared_schema_exists(self.shared_connection()):
+                with translated():
+                    with psycopg.connect(_dsn(), autocommit=True) as ddl:
+                        try:
+                            ddl.execute(f'CREATE SCHEMA "{self.shared_schema}"')
+                        except psycopg.errors.DuplicateSchema:
+                            pass  # a concurrent creator won the race; the DDL below is idempotent
+                        ddl.execute(f'SET search_path TO "{self.shared_schema}"')
+                        with _schema_ddl_lock(self.shared_schema):
+                            _ddl.apply(ddl)
+                with self._backend._lock:
+                    self._backend._created_schemas.add(self.shared_schema)
+                    self._backend._shared_schema_created = True
+            self._shared_schema_ready = True
+
+    def _shared_read_conn(self) -> Optional[Connection]:
+        """The handle's shared read connection, or ``None`` when the shared schema has never been written:
+        an uninitialised shared store reads empty (the reference's missing shared file), and is never
+        created by a read."""
+        self._refuse_read()
+        if self._shared_conn is not None:
+            return self._shared_conn
+        with self._shared_conn_assign_lock:
+            if self._shared_conn is not None:
+                return self._shared_conn
+            self._backend._require_open()
+            dsn = _dsn()
+            with translated():
+                conn = _pool_for(dsn).getconn()
+                self._shared_checkout(conn)
+                if not self._shared_schema_exists(conn):
+                    conn.commit()
+                    _pool_for(dsn).putconn(conn)
+                    return None
+            self._shared_conn = conn
+            return conn
+
     # ── verbs' doors ──
 
     def ready(self) -> None:
@@ -797,6 +915,27 @@ class PostgresStore:
                     # previous store's pin or ``public``). Re-pin and settle it as the session default so the
                     # cached connection stays bound to this store's schema.
                     self._checkout(conn)
+                    conn.commit()
+                    raise
+
+    @contextmanager
+    def shared_tx(self) -> Iterator[Connection]:
+        """One write transaction on the shared schema (the shared placement of the hosted rooms): the shared
+        schema exists, the work runs on the handle's shared connection and commits, or rolls back and raises
+        the contract error family. The shared twin of :meth:`tx`."""
+        self.require_open()
+        with translated():
+            self.ensure_shared_schema()
+            conn = self.shared_connection()
+            with self._write_lock:
+                try:
+                    yield conn
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    # Re-pin the shared schema (a rollback undoes the checkout's ``SET search_path``) and
+                    # settle it as the session default so the cached connection stays bound to it.
+                    self._shared_checkout(conn)
                     conn.commit()
                     raise
 
@@ -867,15 +1006,43 @@ class PostgresStore:
             return None
         return next(iter(row.values()))
 
+    def shared_one(self, sql: str, *params: Any) -> Optional[dict[str, Any]]:
+        """One row of a read on the shared schema, as a dict; ``None`` when the read is empty or the shared
+        schema is uninitialised."""
+        conn = self._shared_read_conn()
+        if conn is None:
+            return None
+        with translated():
+            return conn.execute(sql, params or None).fetchone()
+
+    def shared_all(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        """Every row of a read on the shared schema, as dicts, in the statement's order; empty when the
+        shared schema is uninitialised."""
+        conn = self._shared_read_conn()
+        if conn is None:
+            return []
+        with translated():
+            return conn.execute(sql, params or None).fetchall()
+
+    def shared_scalar(self, sql: str, *params: Any) -> Any:
+        """The single value of a single-column, single-row read on the shared schema; ``None`` when the read
+        is empty."""
+        row = self.shared_one(sql, *params)
+        if row is None:
+            return None
+        return next(iter(row.values()))
+
     def close(self) -> None:
         """Hand the handle's connections back to the pool (``putconn`` closes it only when the pool is full)."""
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            try:
-                with translated():
-                    _pool_for(_dsn()).putconn(conn)
-            except PersistenceError:
-                pass
+        for attr in ("_conn", "_shared_conn"):
+            conn = getattr(self, attr)
+            setattr(self, attr, None)
+            if conn is not None:
+                try:
+                    with translated():
+                        _pool_for(_dsn()).putconn(conn)
+                except PersistenceError:
+                    pass
         pinned = getattr(self._snapshot_pins, "conn", None)
         if pinned is not None:
             self._snapshot_pins.conn = None
