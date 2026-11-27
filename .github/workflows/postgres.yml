@@ -1,0 +1,106 @@
+name: Postgres contract lane
+
+# The PostgreSQL persistence backend against a real Postgres 18.1 server.
+#
+# The contract suite (tests/contracts/) runs against all three backends —
+# in_memory, sqlite and postgres — and the postgres backend registers only when
+# HERMES_DATABASE_URL is set (persistence/postgres/_backend.py; the lane's
+# DSN reaches the per-file pytest processes through scripts/run_tests.sh's
+# explicit environment allowlist, the same way remote-backends.yml carries its
+# sshd coordinates).
+#
+# This job provides the server: a throwaway postgres:18.1 service container on
+# 127.0.0.1. The DSN is a fixed, non-secret literal — the container is
+# disposable and holds no data, the same class as the throwaway sshd host in
+# remote-backends.yml. No secrets are involved and none may be added:
+# ci.yaml runs PR-controlled code.
+#
+# HERMES_CONTRACT_ACCOUNTING names the accounting-artifact path that makes
+# pytest_sessionfinish fail the run on any contract accounting violation: the
+# whole-suite 0-violation bar (the postgres counts must match the sqlite
+# counts). --fail-on-skip additionally fails on any skip, which in this lane
+# means the DSN or the backend failed to wire through, not a pass.
+#
+# ci.yaml calls this only when a PR touches the postgres backend, the contract
+# suite, or the runner's DSN allowlist (the classifier's `postgres` lane) and
+# on every push to main.
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: Commit to test and build. Empty keeps the triggering commit.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-${{ (github.ref_type == 'tag' || inputs.commit != '') && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.commit == '' }}
+
+env:
+  # The service image, pinned by digest so a tag move cannot change what the
+  # lane tests. postgres:18.1 (18.1 on 2026-11-24) is the version cluster1
+  # runs; the local gate uses the same 18.1.
+  HERMES_TEST_PG_IMAGE: postgres:18.1@sha256:fcead2bce66b7ca8d5018c20a986fa5644cced1732d2cb028316277774d242aa
+
+jobs:
+  postgres-contracts:
+    name: Contract suite against a real Postgres 18
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: ${{ env.HERMES_TEST_PG_IMAGE }}
+        env:
+          # Fixed literals for a disposable container: no secrets, no data.
+          POSTGRES_USER: hermes
+          POSTGRES_PASSWORD: hermes-ci
+          POSTGRES_DB: hermes_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hermes -d hermes_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Checkout code
+        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        with:
+          ref: ${{ inputs.commit }}
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          # The postgres extra (psycopg[binary] + psycopg_pool) is what the
+          # backend imports; without it the backend module would not import.
+          extras: '["postgres"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Run the contract suite against Postgres
+        env:
+          # The DSN the postgres backend registers on. The throwaway
+          # credentials match the service container's fixed literals above.
+          HERMES_DATABASE_URL: postgresql://hermes:hermes-ci@127.0.0.1:5432/hermes_test
+          # The accounting artifact: pytest_sessionfinish fails the run on any
+          # violation (0-violation bar), and the artifact is uploaded on
+          # failure so the counts can be read.
+          HERMES_CONTRACT_ACCOUNTING: ${{ runner.temp }}/pg-contract-accounting.json
+          # Provider keys blanked, as in the other hermetic lanes: the
+          # contract suite must not call a live provider.
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        # A skip here means the DSN or the backend did not wire through
+        # (the suite skips postgres cases when HERMES_DATABASE_URL is unset),
+        # which would be a green lane over zero coverage: --fail-on-skip
+        # decides that from pytest's parsed counts, not the progress line.
+        run: scripts/run_tests.sh --fail-on-skip tests/contracts/
+
+      - name: Accounting artifact (failure only)
+        if: failure()
+        run: cat "$HERMES_CONTRACT_ACCOUNTING" 2>/dev/null || echo "no accounting artifact was written"

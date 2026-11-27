@@ -49,13 +49,14 @@ DEFAULT = {
     "desktop_updater": True,
     "rust": True,
     "remote_backends": True,
+    "postgres": True,
     "catalog": True,
 }
 
 SLOW_LANES = {"docker", "nix", "e2e", "e2e_upgrade", "e2e_desktop_core", "e2e_desktop_update"}
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, catalog=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_lock=False, npm_lock=False, bootstrap=False, desktop_updater=False, rust=False, docker_meta=False, python_prod=None, nix=False, docker=None, e2e=False, e2e_upgrade=False, e2e_desktop_core=False, e2e_desktop_update=False, remote_backends=False, postgres=False, catalog=False) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
     #
@@ -84,6 +85,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, uv_
         "desktop_updater": desktop_updater,
         "rust": rust,
         "remote_backends": remote_backends,
+        "postgres": postgres,
         "catalog": catalog,
     }
 
@@ -380,6 +382,17 @@ CASES = {
     "sshd container setup → remote_backends": (
         ["scripts/ci/test_sshd_container_setup.sh"], _lanes(python=True, remote_backends=True)),
     "other tool → no remote_backends": (["tools/file_tools.py"], _lanes(python=True, scan=True)),
+    # The postgres lane: the real PostgreSQL backend against a service
+    # container (postgres.yml), the contract suite that runs it, and the
+    # runner's DSN allowlist that carries HERMES_DATABASE_URL into the
+    # per-file pytest processes.
+    "postgres backend → postgres lane": (
+        ["persistence/postgres/_backend.py"], _lanes(python=True, scan=True, postgres=True)),
+    "contract suite → postgres lane": (
+        ["tests/contracts/core/test_spine_smoke.py"],
+        _lanes(python=True, python_prod=False, scan=True, postgres=True)),
+    "sqlite backend → no postgres lane": (
+        ["persistence/sqlite/_backend.py"], _lanes(python=True, scan=True, e2e=True)),
     "gateway python → no slow lane": (["gateway/run.py", "agent/x.py"], _lanes(python=True, scan=True)),
     "desktop renderer → no slow lane": (["apps/desktop/src/app/chat/composer.tsx"], _lanes(frontend=True)),
     "python e2e suite → e2e only": (
@@ -502,7 +515,8 @@ def test_every_slow_lane_path_matches_a_tracked_file():
         pytest.skip("not a git checkout")
     files = [_mod.original_path(f) for f in tracked.stdout.splitlines()]
     tables = {**_mod._E2E_LANES, "docker": _mod._DOCKER_PATHS, "nix": _mod._NIX_LANE_PATHS,
-              "remote_backends": _mod._REMOTE_BACKEND_PATHS}
+              "remote_backends": _mod._REMOTE_BACKEND_PATHS,
+              "postgres": _mod._POSTGRES_PATHS}
     dead = {
         (lane, prefix)
         for lane, prefixes in tables.items()
@@ -658,6 +672,9 @@ _REAL_UPDATE_LANES = (
     ("tests-os.yml", "install-update-e2e", "windows-install-update-e2e.yml", "e2e_upgrade"),
     # Not an update suite, but the same contract: the real SSH/Docker backend lane.
     ("ci.yaml", "remote-backends", "remote-backends.yml", "remote_backends"),
+    # And the real PostgreSQL backend lane: the contract suite against a
+    # service container, gated on the postgres lane and required by the gate.
+    ("ci.yaml", "postgres", "postgres.yml", "postgres"),
     # Catalog-only PRs skip the suite, so their catalog tests must gate the merge.
     ("ci.yaml", "catalog-tests", "catalog-tests.yml", "catalog"),
 )

@@ -69,6 +69,9 @@ outputs:
   remote_backends:
     description: Run the SSH and Docker terminal backends against a real sshd and Docker daemon.
     value: ${{ steps.classify.outputs.remote_backends }}
+  postgres:
+    description: Run the contract suite against a real Postgres 18 service container (the postgres persistence backend).
+    value: ${{ steps.classify.outputs.postgres }}
   catalog:
     description: Run the plugin-catalog tests (catalog-only diffs run these instead of the Python suite).
     value: ${{ steps.classify.outputs.catalog }}

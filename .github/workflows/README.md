@@ -30,7 +30,7 @@ pull_request / push main
  ├─ ci.yaml  (CI)  ── detect ──┬─ tests.yml ─────────────── (e2e jobs: release/dispatch only)
  │                             ├─ tests-os.yml ──────────── windows-install-update-e2e.yml
  │                             ├─ lint.yml, js-tests.yml, rust-tests.yml, catalog-tests.yml
- │                             ├─ remote-backends.yml, bootstrap-installer.yml, docs-site-checks.yml
+ │                             ├─ remote-backends.yml, postgres.yml, bootstrap-installer.yml, docs-site-checks.yml
  │                             ├─ e2e-desktop-core.yml, e2e-desktop-update.yml (release/dispatch only)
  │                             ├─ e2e-desktop.yml (disabled: `if: false`)
  │                             ├─ repo-guards.yml (one job: every cheap guard as a lane-gated step)
@@ -205,6 +205,7 @@ Then a gate step in `ci.yaml` rewrites the result:
 | `bootstrap` | `install.sh` and its pin fragments and stamp |
 | `desktop_updater` | `scripts/desktop-update/` and its Windows hand-off tests |
 | `remote_backends` | the SSH/Docker terminal backends, the terminal tool, their real-backend tests |
+| `postgres` | the PostgreSQL backend (`persistence/postgres/`), the contract suite (`tests/contracts/`), the runner's DSN allowlist |
 | `uv_lock` | `pyproject.toml` or `uv.lock` |
 | `deps` | `pyproject.toml` |
 | `scan` | Python files, `.pth`, setup hooks |
@@ -237,6 +238,7 @@ of every suite that reads it.
 | Rust tests | `rust-tests.yml` | `rust` | no Rust change |
 | Catalog tests | `catalog-tests.yml` | `catalog` | no catalog data change |
 | Remote terminal backends | `remote-backends.yml` | `remote_backends` | no backend change |
+| Postgres contract lane | `postgres.yml` | `postgres` | no postgres-backend / contract-suite / runner change |
 | Bootstrap installer | `bootstrap-installer.yml` | `bootstrap` | no installer change |
 | Desktop E2E | `e2e-desktop.yml` | **never** (`if: false`, deferred as flaky) | always |
 | Desktop core E2E | `e2e-desktop-core.yml` | `e2e_desktop_core` (release or dispatch) | PRs and pushes |
@@ -273,8 +275,8 @@ ones. OSV runs on a weekly schedule.
 - **Regular mode (PR / push / dispatch without `release`):** any non-success
   that is not an allowed skip fails the gate. Skips are allowed, except for
   the lane-bound consumers `tests`, `tests-os`, `e2e-desktop-update`,
-  `remote-backends` and `catalog-tests`: when `detect` selected their lane,
-  they must succeed.
+  `remote-backends`, `postgres` and `catalog-tests`: when `detect` selected
+  their lane, they must succeed.
 - **Cancelled duplicate (PR runs, `--allow-superseded`):** GitHub can deliver
   one push as two `pull_request` runs (seen when the push also dismisses a
   stale review). The per-PR concurrency group cancels the older copy, and
@@ -607,6 +609,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `osv-scanner.yml` | OSV-Scanner | cron Mon 09:00, dispatch | none |
 | `plugin-catalog-ci.yml` | Plugin Catalog CI | PR (paths) | none |
 | `pm-bundle.yml` | PM Bundle | PR (paths), dispatch, call | stable |
+| `postgres.yml` | Postgres contract lane | R | ci |
 | `remote-backends.yml` | Remote terminal backends | R | ci |
 | `repo-guards.yml` | Repository guards | R | ci |
 | `rust-tests.yml` | Rust tests | R | ci |

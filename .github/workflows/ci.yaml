@@ -88,6 +88,7 @@ jobs:
       desktop_updater: ${{ steps.gate-lanes.outputs.desktop_updater }}
       rust: ${{ steps.gate-lanes.outputs.rust }}
       remote_backends: ${{ steps.gate-lanes.outputs.remote_backends }}
+      postgres: ${{ steps.gate-lanes.outputs.postgres }}
       catalog: ${{ steps.gate-lanes.outputs.catalog }}
       docker_meta: ${{ steps.gate-lanes.outputs.docker_meta }}
       e2e: ${{ steps.gate-lanes.outputs.e2e }}
@@ -232,6 +233,20 @@ jobs:
     with:
       commit: ${{ inputs.commit }}
 
+  postgres:
+    name: Postgres contract lane
+    needs: detect
+    # The PostgreSQL persistence backend (persistence/postgres/) against a real
+    # postgres:18.1 service container: the contract suite with the postgres
+    # backend registered (HERMES_DATABASE_URL) and the 0-violation accounting
+    # bar (HERMES_CONTRACT_ACCOUNTING). Only PRs that touch the backend, the
+    # contract suite, or the runner's DSN allowlist start it (and every push
+    # to main); required whenever detect selects it.
+    if: needs.detect.outputs.postgres == 'true'
+    uses: ./.github/workflows/postgres.yml
+    with:
+      commit: ${{ inputs.commit }}
+
   bootstrap-installer:
     name: Bootstrap installer
     needs: detect
@@ -351,6 +366,7 @@ jobs:
       - js-tests
       - rust-tests
       - remote-backends
+      - postgres
       - catalog-tests
       - bootstrap-installer
       - e2e-desktop

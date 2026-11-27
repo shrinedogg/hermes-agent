@@ -53,6 +53,11 @@ Lanes:
   sshd container and the runner's Docker daemon (remote-backends.yml). Every
   other test of those backends is mocked, so a change to the backends, the
   terminal tool, or the real-backend tests runs it on the PR.
+* ``postgres`` — the PostgreSQL persistence backend (``persistence/postgres/``)
+  against a real Postgres 18 service container (postgres.yml). The contract
+  suite registers the backend only when ``HERMES_DATABASE_URL`` is set, so a
+  change to the backend, the contract suite it runs in, or the runner's
+  environment allowlist that carries the DSN runs it on the PR.
 
 ``docker``, ``nix`` and the E2E lanes take most of the larger-runner minutes.
 An ordinary product change does not start them on a pull request. Every push
@@ -236,6 +241,17 @@ _REMOTE_BACKEND_PATHS = (
     "tests/tools/test_docker_backend_real.py",
     "scripts/ci/start_test_sshd.sh",
     "scripts/ci/test_sshd_container_setup.sh",
+    "scripts/run_tests.sh",
+)
+
+# The real PostgreSQL backend lane: the backend package, the contract suite it
+# runs in, and the runner's environment allowlist that carries the DSN
+# (HERMES_DATABASE_URL / HERMES_CONTRACT_ACCOUNTING) into each pytest process.
+# postgres.yml provides the server: a throwaway postgres:18.1 service container
+# on 127.0.0.1, no secrets.
+_POSTGRES_PATHS = (
+    "persistence/postgres/",
+    "tests/contracts/",
     "scripts/run_tests.sh",
 )
 
@@ -700,6 +716,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         "desktop_updater": any(_is_desktop_updater(f) for f in files),
         "rust": any(_is_rust(f) for f in files),
         "remote_backends": any(f.startswith(_REMOTE_BACKEND_PATHS) for f in files),
+        "postgres": any(f.startswith(_POSTGRES_PATHS) for f in files),
         "catalog": catalog,
         **{lane: run_e2e or on for lane, on in _slow_lanes(files).items()},
     }
@@ -722,6 +739,7 @@ def classify(files: list[str], run_e2e: bool = False) -> dict[str, bool]:
         ret["desktop_updater"] = True
         ret["rust"] = True
         ret["remote_backends"] = True
+        ret["postgres"] = True
         ret["catalog"] = True
         ret.update(dict.fromkeys(_slow_lanes([]), True))
     return ret

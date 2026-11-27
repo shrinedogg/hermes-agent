@@ -56,6 +56,7 @@ _UPDATE_CONSUMER_LANES = {
     "tests-os": ("python", "desktop_updater", "e2e", "e2e_upgrade"),
     "e2e-desktop-update": ("e2e_desktop_update",),
     "remote-backends": ("remote_backends",),
+    "postgres": ("postgres",),
     "catalog-tests": ("catalog",),
 }
 
