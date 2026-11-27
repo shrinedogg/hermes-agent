@@ -244,7 +244,9 @@ class PgLineageRepository:
             or lock_row["holder"] != compression_lock_holder
             or float(lock_row["expires_at"]) <= time.time()
         ):
-            raise RuntimeError(f"Compression lease lost before publication: {parent_session_id}")
+            from persistence.sqlite._state.errors import CompressionSessionBusyError
+            raise CompressionSessionBusyError(
+                f"Compression lease lost before publication: {parent_session_id}")
         parent = conn.execute(
             """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                       user_id, session_key, chat_id, chat_type,
@@ -540,12 +542,21 @@ class PgLineageRepository:
     def _validate_local_lineage(self, conn, receipt: dict) -> None:
         """The receipt's lineage is a valid root-to-tip walk (the store's ``validate_local_lineage``)."""
         from persistence.authority.bindings import local_session_id
-        from persistence.sqlite.conversation._store.local_migration import legacy_lineage_root
+        from persistence.sqlite.conversation._store.local_migration import LEGACY_PREFIX
         if ("legacy_session_id" not in receipt
                 and receipt["session_id"] != local_session_id(receipt["profile_id"], receipt["principal_id"],
                                                               receipt["request_id"])):
             raise AuthorityRefusal("storage_unavailable")
-        root = legacy_lineage_root_on_conn(conn, receipt)
+        # The PG-dialect ``legacy_lineage_root``: a migrated receipt's root is the legacy id, proven by
+        # its durable migration marker.
+        root = receipt.get("legacy_session_id", receipt["session_id"])
+        if "legacy_session_id" in receipt:
+            if root != receipt["session_id"]:
+                raise AuthorityRefusal("storage_unavailable")
+            row = conn.execute("SELECT value FROM state_meta WHERE key = %s", (LEGACY_PREFIX + root,)).fetchone()
+            expected = {k: receipt[k] for k in ("session_id", "profile_id", "principal_id", "legacy_session_id")}
+            if row is None or json.loads(row["value"]) != expected:
+                raise AuthorityRefusal("storage_unavailable")
         lineage = receipt.get("lineage", [root])
         if (not isinstance(lineage, list) or not lineage or len(set(lineage)) != len(lineage)
                 or lineage[0] != root or lineage[-1] != receipt["entry"]["session_id"]):

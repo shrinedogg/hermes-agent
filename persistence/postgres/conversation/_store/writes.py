@@ -264,16 +264,17 @@ def clear_transcript(store, session_id: str) -> None:
 
 # ── in-place compaction ──
 
-def archive_and_compact(store, session_id: str, compacted_messages: list[dict[str, Any]], *,
-                       model_config_patch: Optional[dict[str, Any]] = None,
-                       watermark: Optional[int] = None, lock_holder: Optional[str] = None,
-                       tail_count: int = 0, carried_messages: Optional[list[dict[str, Any]]] = None,
-                       covered_ids: Optional[list[int]] = None,
-                       unresolved_held: Optional[list[dict[str, Any]]] = None,
-                       held_for_cas: Optional[list[dict[str, Any]]] = None) -> int:
-    """Non-destructive in-place compaction under ONE session id (the SQLite ``archive_and_compact``
-    port): soft-archive the active rows, insert the compacted set, clone the concurrent tail, all in
-    one transaction; returns the new ACTIVE count."""
+def archive_and_compact_on_conn(conn, session_id: str, compacted_messages: list[dict[str, Any]], *,
+                               model_config_patch: Optional[dict[str, Any]] = None,
+                               watermark: Optional[int] = None, lock_holder: Optional[str] = None,
+                               tail_count: int = 0, carried_messages: Optional[list[dict[str, Any]]] = None,
+                               covered_ids: Optional[list[int]] = None,
+                               unresolved_held: Optional[list[dict[str, Any]]] = None,
+                               held_for_cas: Optional[list[dict[str, Any]]] = None) -> int:
+    """The owner's in-place compaction body on the CALLER's transaction (the reference's
+    ``_archive_and_compact_on_conn``): soft-archive the active rows, insert the compacted set, clone
+    the concurrent tail; returns the new ACTIVE count. One body, so the worker's ``compression.archive``
+    receipt and the owner's ``archive_and_compact`` cannot drift."""
     from .coverage import _carried_tail_ids, _carried_tail_slots, _proved_coverage, _resolve_carried_row_ids, _tail_originals, _uncounted_merged_rows
     from .prune_rewrite import held_row_mismatches
 
@@ -338,8 +339,26 @@ def archive_and_compact(store, session_id: str, compacted_messages: list[dict[st
         conn.execute(counters_sql, tuple(counter_params))
         return inserted
 
+    return _do(conn)
+
+
+def archive_and_compact(store, session_id: str, compacted_messages: list[dict[str, Any]], *,
+                       model_config_patch: Optional[dict[str, Any]] = None,
+                       watermark: Optional[int] = None, lock_holder: Optional[str] = None,
+                       tail_count: int = 0, carried_messages: Optional[list[dict[str, Any]]] = None,
+                       covered_ids: Optional[list[int]] = None,
+                       unresolved_held: Optional[list[dict[str, Any]]] = None,
+                       held_for_cas: Optional[list[dict[str, Any]]] = None) -> int:
+    """Non-destructive in-place compaction under ONE session id (the SQLite ``archive_and_compact``
+    port): soft-archive the active rows, insert the compacted set, clone the concurrent tail, all in
+    one transaction; returns the new ACTIVE count."""
+
     def _fn(conn):
-        return _do(conn)
+        return archive_and_compact_on_conn(
+            conn, session_id, compacted_messages, model_config_patch=model_config_patch,
+            watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
+            carried_messages=carried_messages, covered_ids=covered_ids,
+            unresolved_held=unresolved_held, held_for_cas=held_for_cas)
 
     return _transcript_write(store, compacted_messages, _fn)
 

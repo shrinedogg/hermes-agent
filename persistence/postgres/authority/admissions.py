@@ -50,6 +50,7 @@ from persistence.authority.admissions import (
     UnheldMedia,
     raise_gate,
 )
+from persistence.authority.bindings import local_session_id
 from persistence.authority.vocabulary import (
     ADMISSION_QUEUE_MAX,
     ADMITTED_REQUEST_CONFLICT,
@@ -67,6 +68,7 @@ from persistence.core.errors import (
     UnknownExecution,
 )
 from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+from persistence.sqlite.conversation._store.local_migration import LEGACY_PREFIX
 from persistence.sqlite.conversation._store.media import PREFIX as MEDIA_RETIRED_PREFIX
 from persistence.sqlite.conversation._store.media import SPILLOVER_PREFIX as SPILLOVER_RETIRED_PREFIX
 from persistence.sqlite.conversation._store.retirement import RETIRED_PREFIX
@@ -263,9 +265,21 @@ def _local_physical_target(conn, session_id: str) -> str:
     entry = receipt.get("entry")
     if not isinstance(entry, dict) or entry.get("session_id") is None:
         raise AuthorityRefusal("storage_unavailable")
-    lineage = receipt.get("lineage")
-    if (not isinstance(lineage, list) or not lineage or lineage[-1] != entry["session_id"]
-            or len(set(lineage)) != len(lineage)):
+    # The reference's identity fence (a migrated receipt carries ``legacy_session_id`` instead).
+    if "legacy_session_id" not in receipt and receipt["session_id"] != str(
+            local_session_id(receipt.get("profile_id"), receipt.get("principal_id"), receipt.get("request_id"))):
+        raise AuthorityRefusal("storage_unavailable")
+    root = receipt.get("legacy_session_id", receipt["session_id"])
+    if "legacy_session_id" in receipt:
+        if root != receipt["session_id"]:
+            raise AuthorityRefusal("storage_unavailable")
+        legacy_row = conn.execute("SELECT value FROM state_meta WHERE key = %s", (LEGACY_PREFIX + root,)).fetchone()
+        expected = {k: receipt.get(k) for k in ("session_id", "profile_id", "principal_id", "legacy_session_id")}
+        if legacy_row is None or json.loads(legacy_row["value"]) != expected:
+            raise AuthorityRefusal("storage_unavailable")
+    lineage = receipt.get("lineage", [root])
+    if (not isinstance(lineage, list) or not lineage or len(set(lineage)) != len(lineage)
+            or lineage[0] != root or lineage[-1] != entry["session_id"]):
         raise AuthorityRefusal("storage_unavailable")
     for parent_id, child_id in zip(lineage, lineage[1:]):
         parent = conn.execute("SELECT end_reason FROM sessions WHERE id = %s", (parent_id,)).fetchone()
@@ -610,11 +624,16 @@ def _authorize_admission(conn, *, epoch: int, principal_id: str, session_id: str
 # ── the discarded-turn closer (the reference's ``close_discarded_turn`` port, on the PG message door) ──
 
 
-def _append_messages_in_transaction(conn, session_id: str, messages: list[dict[str, Any]]) -> int:
+def _append_messages_in_transaction(conn, session_id: str, messages: list[dict[str, Any]], *,
+                                  compression_lock_holder: str | None = None,
+                                  turn_lease_holder: str | None = None,
+                                  turn_lease_ttl_seconds: float = 300.0) -> int:
     """The reference's ``_append_messages_in_transaction`` on the PG message door: the transcript
     write guards, the repair-batch resolution, the insert (the DDL triggers mint ``message_uid``
     and ``display_order``) and the session counter bump, in the caller's transaction."""
-    _check_transcript_write_guards(conn, session_id, None)
+    _check_transcript_write_guards(conn, session_id, compression_lock_holder,
+                                   turn_lease_holder=turn_lease_holder,
+                                   turn_lease_ttl_seconds=turn_lease_ttl_seconds)
     inserted_rows = resolve_and_repair_transcript_batch(
         conn, session_id, messages,
         encode_content_fn=_encode_content, decode_content_fn=_decode_content,
