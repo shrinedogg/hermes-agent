@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import time
+from functools import lru_cache
 from typing import Any, Mapping, Optional
 
 from process_identity import holder_process_is_dead
@@ -86,17 +88,45 @@ API_CONTENT_TEXT = "hermes_nul_safe_text(api_content)"
 CONTENT_TEXT_LEN = "hermes_content_text_len(content)"
 
 
+def _sqlite_real_text(value: float) -> Optional[str]:
+    """The stored form of a ``float`` bound to the reference's TEXT content column — the SQLite
+    REAL-to-TEXT affinity (NaN stores NULL, infinities store ``'Inf'``/``'-Inf'``, everything else
+    the engine's own conversion). The reference backend's storage engine is the bundled
+    :mod:`sqlite3` module, so the conversion runs through a scratch in-memory database: the same
+    code path that produced the reference's stored bytes, so the two cannot drift. Cached: float
+    content (timestamps, costs) repeats, and the scratch DB is the only real cost."""
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute("CREATE TABLE _affinity(content TEXT)")
+        con.execute("INSERT INTO _affinity VALUES (?)", (value,))
+        return con.execute("SELECT content FROM _affinity").fetchone()[0]
+    finally:
+        con.close()
+
+
+_sqlite_real_text = lru_cache(maxsize=8192)(_sqlite_real_text)
+
+
 def _payload_bytes(value: Any) -> Optional[bytes]:
     """A payload column (``content``/``api_content``/``reasoning_content``) as its BYTEA storage form:
     UTF-8 bytes (PostgreSQL ``text`` cannot hold the NUL the ``\\x00json:`` sentinel encoding carries;
-    the SQLite reference stores it in a BLOB/TEXT column that can). Non-string scalars are coerced
-    through ``str`` first (the SQLite TEXT affinity)."""
+    the SQLite reference stores it in a BLOB/TEXT column that can). Non-string scalars take the
+    reference's TEXT-affinity storage form: bools bind as 0/1 and store ``'0'``/``'1'``, ints via
+    their decimal text, floats through the reference's REAL-to-TEXT conversion (a stored NaN is
+    NULL, so the payload column is NULL too)."""
     if value is None:
         return None
     if isinstance(value, (bytes, bytearray)):
         return bytes(value)
     if isinstance(value, str):
         return value.encode("utf-8")
+    if isinstance(value, bool):
+        return ("0" if value is False else "1").encode("utf-8")
+    if isinstance(value, int):
+        return str(value).encode("utf-8")
+    if isinstance(value, float):
+        text = _sqlite_real_text(value)
+        return None if text is None else text.encode("utf-8")
     return str(value).encode("utf-8")
 
 

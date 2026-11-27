@@ -15,12 +15,13 @@ import json
 import time
 from typing import Mapping, Optional, Sequence
 
-from persistence import CompressionPublishRefused, Conflict, MessageId, SessionId
+from persistence import CompressionBusy, CompressionPublishRefused, Conflict, MessageId, SessionId
 from persistence.conversation.lineage import CompressionChild, LineageRepository
 from persistence.conversation.messages import ConversationMessage, NewMessage, RowStamp
 from persistence.conversation.sessions import SessionRecord
 from persistence.core.errors import AuthorityRefusal, PermanentStoreError
 from persistence.sqlite._state.common import _ended_by_compression, is_automatic_end_reason
+from persistence.sqlite._state.errors import CompressionSessionBusyError
 from persistence.sqlite.conversation._store.compression import (
     _CHAIN_CAP, _UNSET_CREATED_SOURCES, _walk_compression_chain)
 from persistence.sqlite.conversation._store.local import POLICY_PREFIX
@@ -209,6 +210,10 @@ class PgLineageRepository:
                         require_lease_refresh=require_lease_refresh, lease_ttl_seconds=lease_ttl_seconds,
                         watermark=int(watermark) if watermark is not None else None,
                         watermark_ceiling=int(watermark_ceiling) if watermark_ceiling is not None else None)
+            except CompressionSessionBusyError as exc:
+                # The lease refusal is a store-family error: the contract's class names it (the
+                # reference's ``refusals`` translation).
+                raise CompressionBusy(parent_session_id, str(exc)) from exc
             except pg_errors.UniqueViolation as exc:
                 raise Conflict("session", str(child.session_id)) from exc
             except PermanentStoreError as exc:
@@ -244,7 +249,6 @@ class PgLineageRepository:
             or lock_row["holder"] != compression_lock_holder
             or float(lock_row["expires_at"]) <= time.time()
         ):
-            from persistence.sqlite._state.errors import CompressionSessionBusyError
             raise CompressionSessionBusyError(
                 f"Compression lease lost before publication: {parent_session_id}")
         parent = conn.execute(

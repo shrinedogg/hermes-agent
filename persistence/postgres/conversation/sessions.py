@@ -694,9 +694,16 @@ def _retire_terminal_receipts(conn, session_ids, *, media_root) -> None:
                          (identity_key(row['principal_id'], sid, row['request_id']), json.dumps(row['admission_id'])))
         for raw in workers:
             row = dict(raw)
-            receipts = [dict(r) for r in conn.execute(
-                "SELECT sequence, payload_digest, result_json FROM worker_receipts WHERE execution_id = %s ORDER BY sequence",
-                (row['execution_id'],))]
+            # The PG receipt table carries the record (result + ``payload_digest``) in one JSON column;
+            # restore the reference's (sequence, payload_digest, result_json) receipt shape.
+            receipts = []
+            for r in conn.execute(
+                    "SELECT sequence, record_json FROM worker_receipts WHERE execution_id = %s ORDER BY sequence",
+                    (row['execution_id'],)):
+                record = json.loads(r['record_json'])
+                digest = record.pop('payload_digest', None)
+                receipts.append({'sequence': r['sequence'], 'payload_digest': digest,
+                                 'result_json': json.dumps(record, ensure_ascii=True, allow_nan=False)})
             closing = admission_fingerprint(canonical_target=sid, payload={'operation': 'execution.finish', 'payload': {}})
             for receipt in receipts:
                 if receipt['payload_digest'] != closing:
@@ -2939,15 +2946,29 @@ def list_unlinked_telegram_sessions_for_user(
     store: "PostgresStore", *, chat_id: str, user_id: str, profile_name: str = "default", limit: int = 10,
 ) -> list:
     """This user's Telegram sessions not bound to a topic (the SQLite
-    ``list_unlinked_telegram_sessions_for_user``; the topic-bindings table is not in the port's DDL,
-    so the profile-unscoped query is used: every unlinked telegram row of the user, any owner)."""
-    rows = store.all(
-        "SELECT s.*, " + _PROMPT_RESOLVED_SQL + f", {_preview_raw('s.id')}, "
-        f"{_last_active('s')} AS last_active "
-        "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-        "WHERE s.source = 'telegram' AND s.user_id = %s "
-        "ORDER BY last_active DESC NULLS LAST, s.started_at DESC LIMIT %s",
-        str(user_id), int(limit))
+    ``list_unlinked_telegram_sessions_for_user``): once the topic-bindings table exists in the
+    schema (``prepare_topic_storage`` created it), the listing is scoped to the caller's profile
+    and excludes topic-bound sessions; before that (the table absent) the profile-unscoped query
+    is used: every unlinked telegram row of the user, any owner."""
+    from persistence.sqlite.conversation._store.telegram import _normalize_telegram_topic_profile_name
+    head = ("SELECT s.*, " + _PROMPT_RESOLVED_SQL + f", {_preview_raw('s.id')}, "
+            f"{_last_active('s')} AS last_active "
+            "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+            "WHERE s.source = 'telegram' AND s.user_id = %s ")
+    tail = "ORDER BY last_active DESC NULLS LAST, s.started_at DESC LIMIT %s"
+    probe = store.one(
+        "SELECT EXISTS ("
+        "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = current_schema() AND c.relname = 'telegram_dm_topic_bindings')"
+        " AS has_table")
+    if probe is not None and bool(probe["has_table"]):
+        rows = store.all(
+            head + ("AND COALESCE(NULLIF(TRIM(s.profile_name), ''), 'default') = %s "
+                    "AND NOT EXISTS (SELECT 1 FROM telegram_dm_topic_bindings b WHERE b.session_id = s.id) "
+                    ) + tail,
+            str(user_id), _normalize_telegram_topic_profile_name(profile_name), int(limit))
+    else:
+        rows = store.all(head + tail, str(user_id), int(limit))
     return [_list_row(row) for row in rows]
 
 
