@@ -1472,10 +1472,11 @@ add_stubs(PgAdmissionsRepository, AdmissionRepository, implemented=_IMPLEMENTED)
 
 
 def _register() -> None:
-    # The ``durable_admissions`` capability is declared only once the gate is fully green; the hosted
-    # admission check awaits the stage-4 hosted rooms port (its state does not exist on the PG schema
-    # yet), so the flag stays off until that module lands.
-    register_repository("admissions", lambda store: PgAdmissionsRepository(store))
+    # The ``durable_admissions`` capability is earned once the gate is fully green, hosted admission
+    # check included: the stage-4 hosted-rooms port landed (its state now exists on the PG schema,
+    # shared placement in the fixed shared schema), the hosted authority contracts pass, and the
+    # reference registers the same flag.
+    register_repository("admissions", lambda store: PgAdmissionsRepository(store), {"durable_admissions": True})
 
 
 _register()
