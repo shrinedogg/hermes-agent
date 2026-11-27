@@ -54,6 +54,15 @@ _has_pytest() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import pytest' 2>/dev/nul
 # shellcheck source=scripts/_activation.sh
 . "$SCRIPT_DIR/_activation.sh"
 
+# A DSN set means the postgres backend registers: its import needs the
+# ``postgres`` extra (psycopg + psycopg_pool), which the default test
+# environment (the [all] extra) does not carry. Select it for this run's sync.
+# ``HERMES_TEST_ENV_EXTRAS`` is the override; a CI lane or a developer names a
+# different selection (e.g. the provider matrix) the same way.
+if [ -n "${HERMES_DATABASE_URL:-}" ] && [ -z "${HERMES_TEST_ENV_EXTRAS:-}" ]; then
+  export HERMES_TEST_ENV_EXTRAS="all,postgres"
+fi
+
 # A test run under a faked HOME (worktree lanes, probe homes) provisions its
 # test environment from the OS account's tool store instead of downloading
 # ~1 GB of tools into every temporary home, but only while that store already
@@ -231,8 +240,20 @@ _choose_tool_store() {
 if [ -z "${__HERMES_ACTIVATED:-}" ] && _has_pytest "${HERMES_PYTHON:-}"; then
   PYTHON="$HERMES_PYTHON"
   echo "▶ not activated — using HERMES_PYTHON: $PYTHON"
+  if [ -n "${HERMES_DATABASE_URL:-}" ] && ! "$PYTHON" -c "import psycopg" 2>/dev/null; then
+    echo "warning: HERMES_DATABASE_URL is set, but $PYTHON cannot import psycopg — the postgres cases will error at import; give that interpreter the postgres extra." >&2
+  fi
 else
-  if ! hermes_activation_current "$REPO_ROOT"; then
+  if [ -n "${HERMES_TEST_ENV_EXTRAS:-}" ] && [ -z "${__HERMES_TESTS_REEXEC:-}" ]; then
+    # The extras selection is not part of the stamp currency check (it cannot
+    # see which extras an install recorded), so a run that selects extras syncs
+    # the test environment every time: a cheap no-op rebuild when the locked
+    # inputs are unchanged.
+    hermes_sync "$REPO_ROOT" "--test-environment=${HERMES_TEST_ENV_EXTRAS}" || exit 1
+    script="$(hermes_compose_env "$REPO_ROOT" sh)" || exit 1
+    hermes_apply_env "$script"
+    echo "▶ synced the test environment with extras [${HERMES_TEST_ENV_EXTRAS}]"
+  elif ! hermes_activation_current "$REPO_ROOT"; then
     if [ -n "${__HERMES_TESTS_REEXEC:-}" ]; then
       echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
