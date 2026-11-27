@@ -16,10 +16,16 @@ name: Postgres contract lane
 # ci.yaml runs PR-controlled code.
 #
 # HERMES_CONTRACT_ACCOUNTING names the accounting-artifact path that makes
-# pytest_sessionfinish fail the run on any contract accounting violation: the
-# whole-suite 0-violation bar (the postgres counts must match the sqlite
-# counts). --fail-on-skip additionally fails on any skip, which in this lane
-# means the DSN or the backend failed to wire through, not a pass.
+# pytest_sessionfinish fail the run on any contract accounting violation
+# (including an unapproved skip in a mapped case the backend declares):
+# the whole-suite 0-violation bar. A capability skip (a case the backend does
+# not declare — crash-window injection is the in-memory reference's surface;
+# sqlite and postgres skip those cases) is an approved skip and does not fail
+# the run — so the lane does not use --fail-on-skip, which would stay red over
+# those. The wiring is proven instead: the spine-smoke step below runs one
+# cross-backend file against a dedicated artifact and fails the lane unless
+# postgres is registered in it (an unset DSN leaves the artifact with only
+# in_memory + sqlite).
 #
 # ci.yaml calls this only when a PR touches the postgres backend, the contract
 # suite, or the runner's DSN allowlist (the classifier's `postgres` lane) and
@@ -86,21 +92,53 @@ jobs:
           # The DSN the postgres backend registers on. The throwaway
           # credentials match the service container's fixed literals above.
           HERMES_DATABASE_URL: postgresql://hermes:hermes-ci@127.0.0.1:5432/hermes_test
-          # The accounting artifact: pytest_sessionfinish fails the run on any
-          # violation (0-violation bar), and the artifact is uploaded on
-          # failure so the counts can be read.
+          # The accounting artifact: pytest_sessionfinish fails the file on any
+          # violation (0-violation bar, enforced per file), and the artifact is
+          # uploaded on failure so the counts can be read.
           HERMES_CONTRACT_ACCOUNTING: ${{ runner.temp }}/pg-contract-accounting.json
           # Provider keys blanked, as in the other hermetic lanes: the
           # contract suite must not call a live provider.
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-        # A skip here means the DSN or the backend did not wire through
-        # (the suite skips postgres cases when HERMES_DATABASE_URL is unset),
-        # which would be a green lane over zero coverage: --fail-on-skip
-        # decides that from pytest's parsed counts, not the progress line.
-        run: scripts/run_tests.sh --fail-on-skip tests/contracts/
+        # No --fail-on-skip: the suite has approved capability skips (cases the
+        # backends do not declare). The 0-violation bar is the accounting
+        # artifact, and the wiring proof is the spine-smoke step below.
+        run: scripts/run_tests.sh tests/contracts/
 
-      - name: Accounting artifact (failure only)
+      - name: Prove the postgres backend registered (spine-smoke accounting)
+        env:
+          HERMES_DATABASE_URL: postgresql://hermes:hermes-ci@127.0.0.1:5432/hermes_test
+          HERMES_CONTRACT_ACCOUNTING: ${{ runner.temp }}/pg-spine-accounting.json
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        # One cross-backend file against a dedicated artifact: without the DSN
+        # the postgres backend never registers, and the artifact would carry
+        # only in_memory + sqlite — a green suite over zero postgres coverage.
+        run: |
+          scripts/run_tests.sh tests/contracts/core/test_spine_smoke.py
+          python3 - "$HERMES_CONTRACT_ACCOUNTING" <<'PY'
+          import json, sys
+
+          d = json.load(open(sys.argv[1]))
+          backends = d.get("backends", {})
+          violations = d.get("authority", {}).get("violations", [])
+          missing = {"in_memory", "sqlite", "postgres"} - set(backends)
+          if missing:
+              raise SystemExit(
+                  f"postgres did not register: {sorted(missing)} absent from the accounting "
+                  f"artifact — HERMES_DATABASE_URL did not reach the run")
+          if violations:
+              raise SystemExit(f"contract accounting violations: {violations}")
+          pg, sq = backends["postgres"], backends["sqlite"]
+          print(f"registered: {sorted(backends)}; spine counts postgres={pg['passed']} sqlite={sq['passed']}; violations: 0")
+          PY
+
+      - name: Accounting artifacts (failure only)
         if: failure()
-        run: cat "$HERMES_CONTRACT_ACCOUNTING" 2>/dev/null || echo "no accounting artifact was written"
+        run: |
+          echo "=== suite artifact (last file's counts; per-file enforcement is the gate) ==="
+          cat "${RUNNER_TEMP}/pg-contract-accounting.json" 2>/dev/null || echo "no suite accounting artifact was written"
+          echo "=== spine-smoke artifact (the wiring proof) ==="
+          cat "${RUNNER_TEMP}/pg-spine-accounting.json" 2>/dev/null || echo "no spine-smoke accounting artifact was written"
