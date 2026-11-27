@@ -2847,7 +2847,7 @@ def list_cron_job_runs(store: "PostgresStore", job_id: str, limit: int = 20, off
     request_lo, request_hi = cron_request_range(job_id)
     query = (
         "SELECT s.*, " + _CRON_EXECUTION_SQL + " AS cron_execution_id, " + _PROMPT_RESOLVED_SQL
-        + f", {_last_active('s')} AS last_active "
+        + f", {_preview_raw('s.id')}, {_last_active('s')} AS last_active "
         "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
         "WHERE s.source = 'cron' AND s.id IN (" + _CRON_RUN_IDS_SQL + ") "
         "ORDER BY s.started_at DESC, s.id DESC LIMIT %s OFFSET %s")
