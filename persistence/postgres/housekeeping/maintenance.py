@@ -39,6 +39,7 @@ from .._backend import PostgresStore, register_repository, translated
 from .._lineage_common import json_marker_sql, session_last_active_sql
 from ..conversation.lineage import _INSERT_MESSAGE_SQL
 from ..conversation.messages import _payload_str, _row_to_message_dict, _transcript_row
+from ..conversation.sessions import _retire_spillover
 from .._stubs import add_stubs
 from persistence.sqlite.conversation._store.local import (
     API_BINDING_PREFIX, API_DECLARED_PREFIX, POLICY_PREFIX, _policy_target)
@@ -453,9 +454,9 @@ def _retire_local_receipts(conn, session_ids) -> None:
 
 def _retire_sessions(conn, session_ids, *, expiring=(), media_root=None) -> None:
     """The complete deletion fence for the ids deleted in this transaction (the SQLite
-    ``retire_sessions``): terminal receipts, mutation receipts, routes and owner receipts. The
-    media spillover and the terminal result store have no PG tables in stage 1, so their scrubs
-    are no-ops until those repos are ported."""
+    ``retire_sessions``): the spillover archives, terminal receipts, mutation receipts, routes and
+    owner receipts."""
+    _retire_spillover(conn, session_ids)
     _retire_terminal_receipts(conn, session_ids)
     _retire_mutation_receipts(conn, session_ids)
     _retire_routes(conn, session_ids, expiring=expiring)

@@ -1433,7 +1433,7 @@ class PgAdmissionsRepository:
         (the reference's ``retired_candidates``: the prefix range scan, the JSON values decoded)."""
         prefix = MEDIA_RETIRED_PREFIX if kind == "media" else SPILLOVER_RETIRED_PREFIX
         with self._refused():
-            rows = self._store.all("SELECT key, value FROM state_meta WHERE key LIKE %s", prefix + "%")
+            rows = self._store.all("SELECT key, value FROM state_meta WHERE key LIKE %s ORDER BY key", prefix + "%")
         return [(row["key"], json.loads(row["value"])) for row in rows]
 
 
