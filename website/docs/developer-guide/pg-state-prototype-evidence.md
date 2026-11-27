@@ -791,3 +791,58 @@ fix on branch B before merge, or carry as a follow-up issue.
   run-evidence doc. Full tracebacks: `$WS/evidence/gw-proto-pg.log`,
   `gw-proto-sql.log`; diagnosis note:
   `$WS/evidence/diagnosis-pg-gateway-boot-2026-11-07.md`.
+
+## 10. Stage 5 final bar: whole contract suite accounting (refreshed 2026-11-27)
+
+The port (plan 5.7) closes with the whole contract suite green on postgres,
+`HERMES_CONTRACT_ACCOUNTING` enabled in one pytest process per backend, with
+SQLite parity and 0 violations (plan 6.2 layer 6: "the postgres counts match
+the sqlite counts, with 0 violations"). Run on branch `pg-stage5` @
+`6481bb89c8` of the hermes-agent fork, against a local PostgreSQL 18.1 dev
+server (`127.0.0.1:55433`, database `hermes_test`); Python 3.14.9,
+psycopg 3.3.9, psycopg-pool 3.3.3, PostgreSQL 18.1.
+
+### 10.1 Command lines (one pytest process per backend, accounting on)
+
+Postgres run (DSN present; all three backends register and collect):
+
+    env -u PYTHONPATH \
+    HERMES_DATABASE_URL=postgresql://hermes:***@127.0.0.1:55433/hermes_test \
+    HERMES_CONTRACT_ACCOUNTING=accounting-postgres.json \
+    .venv/bin/python -m pytest tests/contracts/ -q
+
+SQLite run (no DSN; per D10 the postgres backend registers only when
+`HERMES_DATABASE_URL` is set, so it collects nothing here):
+
+    env -u PYTHONPATH \
+    HERMES_CONTRACT_ACCOUNTING=accounting-sqlite.json \
+    .venv/bin/python -m pytest tests/contracts/ -q
+
+### 10.2 Accounting (whole-suite artifacts, 0 violations in both)
+
+Postgres run (`accounting-postgres.json`): 7032 passed, 109 skipped, 0 failed
+in 32m10s; authority violations 0.
+
+| backend      | collected | passed | skipped | failed |
+|--------------|-----------|--------|---------|--------|
+| postgres     | 2253      | 2203   | 50      | 0      |
+| sqlite       | 2253      | 2205   | 48      | 0      |
+| in_memory    | 2253      | 2242   | 11      | 0      |
+| backend-neutral | 382    | 382    | 0       | 0      |
+
+SQLite run (`accounting-sqlite.json`): 4829 passed, 59 skipped, 0 failed in
+11m36s; authority violations 0. Per-backend counts identical to the postgres
+run's shared backends (sqlite 2205/48, in_memory 2242/11, backend-neutral
+382/382) — the parity bar holds, and the postgres counts are the
+run's own `postgres` row above: green.
+
+### 10.3 Late product fix found by the whole run
+
+The first whole run (pre-refresh) was green except one failure the stage-gate
+directories had never selected: `test_session_queries_contract.py::
+test_cron_run_entries_carry_the_summary_of_each_run[postgres]`. The PG
+`list_cron_job_runs` SELECT omitted the correlated `_preview_raw` column the
+SQLite `_rich_select` always carries, so cron run entries came back with an
+empty preview while `sessions.summary` resolved it. Fixed in `6481bb89c8`
+(one line in `persistence/postgres/conversation/sessions.py`); the refreshed
+runs above are on that head.
