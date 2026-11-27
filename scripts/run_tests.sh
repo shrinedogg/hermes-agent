@@ -335,6 +335,13 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
 #     a throwaway sshd container and a small public image. The key is a
 #     per-run throwaway, never a credential.
+#   * HERMES_DATABASE_URL points the contract suites' postgres backend at a
+#     throwaway test database (the CI postgres lane's disposable service
+#     container, or a local 127.0.0.1 instance) — same class as the ssh/docker
+#     knobs above: test-infrastructure, never a production credential.
+#     HERMES_CONTRACT_ACCOUNTING names the accounting-artifact path that makes
+#     a contract run fail on an accounting violation (the plan's 0-violation
+#     gate); it is a file path, not a credential.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -352,7 +359,8 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_E2E_UPGRADE_BASE HERMES_E2E_N1_REF \
   HERMES_E2E_INSTALL_REF HERMES_E2E_GIT_OBJECTS HERMES_E2E_KEEP_ROOT \
   HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
+  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE \
+  HERMES_DATABASE_URL HERMES_CONTRACT_ACCOUNTING; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
