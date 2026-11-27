@@ -169,6 +169,40 @@ Key design decisions:
 - **Source tagging** (`cli`, `telegram`, `discord`, etc.) for platform filtering
 - Batch runner and RL trajectories are NOT stored here (separate systems)
 
+## Storage Providers
+
+The store behind this schema is a *provider*: one implementation of the
+persistence contract (`persistence/core/backend.py`) serving a profile's state
+store. All product code reaches the store through the one door
+(`open_persistence` in `persistence_assembly.py`) and never imports a backend
+directly, which is what lets a second backend run the same contract.
+
+| Provider | When it registers | Notes |
+|---|---|---|
+| `in_memory` | always (reference) | The reference backend; volatile, used by the contract suites and by tests. |
+| `sqlite` | always (default) | The bundled store at `~/.hermes/state.db` — the schema above. |
+| `postgres` | only when `HERMES_DATABASE_URL` is set | The optional PostgreSQL backend under `persistence/postgres/`; needs the `postgres` extra (`hermes pm install --extra postgres`). |
+
+### Selecting the postgres provider
+
+- `persistence.provider` — set to `postgres` to serve this profile's store
+  from PostgreSQL. Unset (or `sqlite`) keeps the default SQLite store and
+  behaves exactly as before.
+- `HERMES_DATABASE_URL` — the DSN of the database the backend serves from, e.g.
+  `postgresql://hermes@127.0.0.1:55433/hermes_test`. The backend registers
+  *only* when this variable is set, so a default install never attempts a
+  server connection (plan D10).
+- `persistence.schema` (optional) — names the schema holding this profile's
+  tables inside a shared database (plan D5); unset = a per-home schema derived
+  from the profile.
+
+The tables above are the floor the postgres backend mirrors (its DDL starts
+from `persistence/sqlite/_schema_ddl.py`). The contract suite
+(`tests/contracts/`) runs the backends side by side — the postgres counts must
+match the sqlite counts with zero accounting violations — and the CI
+`postgres` lane (`.github/workflows/postgres.yml`) runs that suite against a
+Postgres 18 service container.
+
 
 ## SQLite Schema
 

@@ -33,6 +33,21 @@ database:
   # synchronous: FULL
 
 # =============================================================================
+# Persistence Provider
+# =============================================================================
+# Which storage backend serves a profile's state store. Unset (or "sqlite") is
+# the default: the bundled SQLite store at ~/.hermes/state.db. The optional
+# "postgres" backend needs the `postgres` extra (psycopg + psycopg_pool) and a
+# database URL; it registers only when HERMES_DATABASE_URL is set (plan D10),
+# so a default install never touches a server.
+persistence:
+  # provider: "sqlite"     # "sqlite" (default) or "postgres"
+  # Optional, postgres only: the schema that names this profile's tables in a
+  # shared database (plan D5). Unset = a per-home schema derived from the
+  # profile. A single-profile host can pin one shared schema explicitly.
+  # schema: "hermes_main"
+
+# =============================================================================
 # Runtime Limits
 # =============================================================================
 # Long-running Hermes server processes raise their RLIMIT_NOFILE soft limit to
