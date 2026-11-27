@@ -574,7 +574,7 @@ class PostgresBackend:
                 _ddl.apply(conn)
                 conn.execute(f'SET search_path TO "{old}"')
                 tables = [
-                    row["table_name"]
+                    row[0]
                     for row in conn.execute(
                         "SELECT table_name FROM information_schema.tables "
                         "WHERE table_schema = %s AND table_type = 'BASE TABLE'", (old,)
@@ -588,10 +588,10 @@ class PostgresBackend:
                     "SELECT table_name, column_name FROM information_schema.columns "
                     "WHERE table_schema = %s AND is_identity = 'YES'", (new,)
                 ):
-                    table, column = row["table_name"], row["column_name"]
+                    table, column = row[0], row[1]
                     conn.execute(
                         f"""SELECT setval(
-                                  (SELECT pg_get_serial_sequence('{new}', '{column}')),
+                                  (SELECT pg_get_serial_sequence('{new}."{table}"', '{column}')),
                                   COALESCE((SELECT MAX({column}) FROM {table}), 1))"""
                     )
         with self._lock:

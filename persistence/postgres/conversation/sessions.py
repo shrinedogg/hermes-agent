@@ -724,7 +724,12 @@ def _retire_mutation_receipts(conn, session_ids) -> None:
         f" OR ((value::jsonb -> 'result' ->> 'previous_target_session_id') = ANY(%s)))",
         [_MUTATION_PREFIX + '%', ids, ids, ids, ids]).fetchall()
     for key, raw in rows:
-        receipt = json.loads(raw)
+        try:
+            receipt = json.loads(raw)
+        except (TypeError, ValueError):
+            continue  # a malformed receipt names nothing; never crash the delete on it
+        if not isinstance(receipt, dict):
+            continue
         result = receipt.get('result')
         if isinstance(result, dict) and any(f in result for f in _MUTATION_TRANSCRIPT_FIELDS):
             receipt['result'] = {k: (None if k in _MUTATION_TRANSCRIPT_FIELDS else v) for k, v in result.items()}
@@ -2325,9 +2330,10 @@ def _session_turn_lease_key_on_conn(conn, session_id: str) -> str:
         step = conn.execute(
             "SELECT 1 FROM sessions child JOIN sessions parent ON parent.id = child.parent_session_id "
             "WHERE child.id = %s AND parent.end_reason = 'compression' "
-            f"AND {_json_key_text('child.model_config', '_branched_from')} IS NULL "
-            f"AND {_json_key_text('child.model_config', '_delegate_from')} IS NULL "
-            f"AND NOT ({_RESET_CHILD_SQL.format(a='child')}) AND COALESCE(child.source, '') <> 'tool'",
+            f"AND COALESCE({_json_key_text('child.model_config', '_branched_from')}, '') <> child.parent_session_id "
+            f"AND COALESCE({_json_key_text('child.model_config', '_delegate_from')}, '') <> child.parent_session_id "
+            f"AND COALESCE({_json_key_text('child.model_config', '_reset_from')}, '') <> child.parent_session_id "
+            "AND COALESCE(child.source, '') <> 'tool'",
             (current,)).fetchone()
         if step is None:
             break
@@ -2337,12 +2343,12 @@ def _session_turn_lease_key_on_conn(conn, session_id: str) -> str:
 
 def _guarded_ids(conn, ids) -> list:
     """Ids in *ids* protected by a live turn lease / compression lock (the SQLite ``_guarded_ids``;
-    expired or dead-holder guards are reclaimed as a side effect)."""
+    either guard suffices; expired or dead-holder guards are reclaimed as a side effect)."""
     guard_pool = [sid for sid in (ids or []) if sid]
     if not guard_pool:
         return []
     now = time.time()
-    locked = set()
+    guarded: set = set()
     lock_rows = conn.execute(
         f"SELECT session_id, holder, expires_at FROM compression_locks WHERE session_id = ANY(%s)",
         (guard_pool,)).fetchall()
@@ -2350,20 +2356,22 @@ def _guarded_ids(conn, ids) -> list:
         if _lease_stale(row, now):
             conn.execute("DELETE FROM compression_locks WHERE session_id = %s", (row["session_id"],))
         else:
-            locked.add(row["session_id"])
-    active = [sid for sid in guard_pool if sid in locked]
+            guarded.add(row["session_id"])
     # The lease guards the conversation, so key by each id's compression root.
-    keys = list(dict.fromkeys(_session_turn_lease_key_on_conn(conn, sid) for sid in active))
+    key_of = {sid: _session_turn_lease_key_on_conn(conn, sid) for sid in guard_pool}
+    keys = list(dict.fromkeys(key_of.values()))
     lease_rows = conn.execute(
         f"SELECT conversation_id, holder, expires_at FROM session_turn_leases WHERE conversation_id = ANY(%s)",
         (keys,)).fetchall()
-    leased: set = set()
     for row in lease_rows:
         if _lease_stale(row, now):
             conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = %s", (row["conversation_id"],))
         else:
-            leased.add(row["conversation_id"])
-    return [sid for sid in active if _session_turn_lease_key_on_conn(conn, sid) in leased]
+            live_root = row["conversation_id"]
+            for sid in guard_pool:
+                if key_of[sid] == live_root:
+                    guarded.add(sid)
+    return [sid for sid in guard_pool if sid in guarded]
 
 
 def get_session_delete_targets(store: "PostgresStore", session_id: str) -> list:
